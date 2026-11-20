@@ -63,15 +63,15 @@
     "test:integration": "vitest --run --config vitest.integration.config.ts"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "0.83.0",
-    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-agent-core": "1.5.2",
+    "@earendil-works/pi-ai": "1.5.2",
     "@onkernel/sdk": ">=0.49.0 <1.0.0",
-    "openai": "^6.26.0",
+    "openai": "^7.19.0",
     "sharp": "^0.35.3",
-    "typebox": "1.3.7"
+    "typebox": "1.3.27"
   },
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": "0.83.0",
+    "@earendil-works/pi-agent-core": "1.5.2",
     "@earendil-works/pi-coding-agent": "*"
   },
   "peerDependenciesMeta": {
@@ -80,9 +80,9 @@
     }
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "^0.117.1",
-    "@earendil-works/pi-coding-agent": "0.83.0",
-    "@google/genai": "^2.17.1",
+    "@anthropic-ai/sdk": "^0.129.0",
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@google/genai": "^2.21.0",
     "tsdown": "^0.22.2",
     "vitest": "^3.2.4"
   }

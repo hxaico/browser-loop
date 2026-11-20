@@ -66,33 +66,23 @@ The compiled `model` carries the transport its tools derive: selecting a
 provider-native browser or computer surface can change `model.api`, so the pair
 has to reach pi together.
 
-### With pi's `AgentHarness`
+### With a `LoopHarnessLike` runner
 
-Use pi's harness for session-backed transcripts, skills, prompt templates,
-compaction, steering, and follow-ups. `activate()` registers the behaviors this
-package owns that are pi event handlers rather than constructor options, and
-points the handle's `models` at this catalog:
+Use a `LoopHarnessLike` runner over pi's `Agent` (see `examples/harness.ts`) for
+session-backed transcripts, steering, and follow-ups. `activate()` registers
+the behaviors this package owns that are event handlers rather than constructor
+options, and points the handle's `models` at this catalog:
 
 ```ts
-import { AgentHarness, InMemorySessionRepo } from "@earendil-works/pi-agent-core";
+import { Agent } from "@earendil-works/pi-agent-core";
 import { loop } from "@onkernel/browser-loop";
-import { attach } from "@onkernel/browser-loop/pi";
+import { attach, type LoopContextualTool, type LoopHarnessLike } from "@onkernel/browser-loop/pi";
 
-const session = await new InMemorySessionRepo().create();
 const kb = attach({ client, browser });
 const compiled = kb.compile({ model: "openai:gpt-5.6-sol", tools: loop.toolsets.browser() });
 
-const harness = new AgentHarness({
-  session,
-  model: compiled.model,
-  models: compiled.models,
-  tools: [...compiled.tools],
-  activeToolNames: compiled.tools.map((tool) => tool.name),
-  systemPrompt: "Use the supplied browser tools.",
-});
+declare const harness: LoopHarnessLike<LoopContextualTool<undefined>>;
 compiled.activate(harness);
-
-await harness.prompt("Find the pricing page.");
 ```
 
 To change the model or the tool list on a running harness, compile the new pair
@@ -103,45 +93,48 @@ await kb.compile({ model: "google:gemini-3.6-flash", tools: loop.providers.googl
 ```
 
 `apply()` moves the model and tools together, sets the model only when the
-derived transport actually moved, and restores the previous pair if pi rejects
-the new one. Changing the model or the tool list compiles a new pair; nothing
-mutates in place, and one shared execution-resource pool survives every change,
-so browser refs, tabs, connections, and translator state are not reset.
+derived transport actually moved, and restores the previous pair if the harness
+rejects the new one. Changing the model or the tool list compiles a new pair;
+nothing mutates in place, and one shared execution-resource pool survives every
+change, so browser refs, tabs, connections, and translator state are not reset.
 
 `@onkernel/browser-loop/pi` does not re-export pi: install `@earendil-works/pi-agent-core`
-and import its session, skill, prompt-template, compaction, and
-execution-environment primitives directly, as these examples do.
+and construct `Agent` directly, as these examples do.
 
 ### Tool context
 
-Executable harness tools are pi `AgentHarnessTool`s: `execute` receives the
-harness's tool context as its last argument. Supply it once as `toolContext`
-and pi delivers the exact object (or the result of a zero-argument provider)
-to every tool call:
+Executable harness tools are `LoopContextualTool<TContext>`s: `execute` receives
+the harness's tool context as its last argument. Supply `TContext` when
+compiling and deliver it from your runner on every tool call:
 
 ```ts
-import { AgentHarness, createBashTool, createReadTool, type ExecutionToolContext } from "@earendil-works/pi-agent-core";
-import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import { loop } from "@onkernel/browser-loop";
-import { attach } from "@onkernel/browser-loop/pi";
+import { attach, type LoopContextualTool, type LoopHarnessLike } from "@onkernel/browser-loop/pi";
 
-const compiled = kb.compile<ExecutionToolContext>({
+interface RequestContext {
+  requestId: string;
+}
+
+const customTool: LoopContextualTool<RequestContext> = {
+  name: "custom",
+  label: "custom",
+  description: "custom tool",
+  parameters: { type: "object", properties: {} },
+  execute: async (_toolCallId, _params, _signal, _onUpdate, context) => ({
+    content: [{ type: "text", text: context.requestId }],
+    details: undefined,
+  }),
+};
+
+const compiled = kb.compile<RequestContext>({
   model: "openai:gpt-5.6-sol",
-  tools: [createReadTool(), createBashTool(), ...loop.toolsets.browser()],
+  tools: [customTool, ...loop.toolsets.browser()],
 });
-const harness = new AgentHarness<ExecutionToolContext>({
-  session,
-  model: compiled.model,
-  models: compiled.models,
-  tools: [...compiled.tools],
-  activeToolNames: compiled.tools.map((tool) => tool.name),
-  toolContext: { env: new NodeExecutionEnv({ cwd: process.cwd() }) },
-  systemPrompt: "Use the supplied tools.",
-});
+declare const harness: LoopHarnessLike<LoopContextualTool<RequestContext>>;
 compiled.activate(harness);
 ```
 
-Compile for the same context the harness delivers, so a later swap stays
+Compile for the same context the runner delivers, so a later swap stays
 type-compatible. Browser Loop specs and plain pi `AgentTool`s are accepted too — they
 simply ignore the context. `compiled.agentTools` is the context-free view for
 the low-level `Agent`.
@@ -427,7 +420,7 @@ unioned and deduplicated; exact-value conflicts throw.
 
 ## Dynamic loading metadata
 
-Ordinary function tools are marked eligible only where pi 0.83.0 supports
+Ordinary function tools are marked eligible only where pi supports
 deferred loading. Provider-native tools are eager-only. The catalog itself does
 not guess when tools were added; a caller that adds tools mid-turn records the
 addition through pi's active-tool change entries.

@@ -1,6 +1,4 @@
 import type {
-	AgentHarness,
-	AgentHarnessTool,
 	AgentMessage,
 	AgentTool,
 	StreamFn,
@@ -11,13 +9,15 @@ import type {
 	Model,
 	Models,
 	SimpleStreamOptions,
+	StreamOptions,
 } from "@earendil-works/pi-ai";
 import type Kernel from "@onkernel/sdk";
 import { LoopExecutionResources, type LoopExecutionDetails } from "../core/resources";
 import type { LoopIncomingToolPlan } from "../core/tool-catalog";
-import { LoopToolManager, type LoopHarnessTool } from "./tool-manager";
+import { LoopToolManager, type LoopContextualTool, type LoopHarnessTool } from "./tool-manager";
 import type { KernelBrowser } from "../core/translator/translator";
 import { getLoopModel, parseLoopModelRef, type LoopModelRef } from "./models";
+import { delegateModels } from "./models-delegate";
 import { resolveProviderRetryPolicy, type LoopRetryOptions, withProviderRetryModels } from "./provider-retry";
 import { loopModels } from "./providers";
 
@@ -51,12 +51,23 @@ export interface LoopAttachOptions {
 	onPayload?: SimpleStreamOptions["onPayload"];
 }
 
+/** Minimal structural harness contract required by {@link LoopCompiled.activate} and {@link LoopCompiled.apply}. */
+export interface LoopHarnessLike<TTool = LoopContextualTool<any>> {
+	getModel(): Model<Api>;
+	setModel(model: Model<Api>): Promise<void> | void;
+	getTools(): readonly TTool[];
+	setTools(tools: TTool[], activeToolNames?: string[]): Promise<void> | void;
+	on(event: string, handler: (...args: any[]) => any): () => void;
+	subscribe(listener: (event: any, signal?: AbortSignal) => Promise<void> | void): () => void;
+	followUp(message: string): Promise<void> | void;
+}
+
 /** One compiled (model, tools) pair, ready to hand to pi. */
 export interface LoopCompiled<TContext extends object | undefined = undefined> {
 	/** The model to stream with, carrying the transport its tools derive. */
 	readonly model: Model<Api>;
 	/** Executable tools, materialized once against the handle's browser pool. */
-	readonly tools: readonly AgentHarnessTool<TContext>[];
+	readonly tools: readonly LoopContextualTool<TContext>[];
 	/** Same tools viewed as pi `AgentTool`s, for the low-level `Agent`. */
 	readonly agentTools: readonly AgentTool[];
 	/**
@@ -74,7 +85,7 @@ export interface LoopCompiled<TContext extends object | undefined = undefined> {
 	 * recovery), and point `models` at this catalog. Returns a release that undoes
 	 * both. Activating another pair releases this one.
 	 */
-	activate(harness: AgentHarness<any, any, any, any>): () => void;
+	activate(harness: LoopHarnessLike<any>): () => void;
 	/**
 	 * Swap a running harness onto this pair, then activate it. Model and tools
 	 * move together because the transport is derived from both: setting one
@@ -83,7 +94,7 @@ export interface LoopCompiled<TContext extends object | undefined = undefined> {
 	 * tools-only change records no model change. A failure restores the harness's
 	 * previous pair before rethrowing, leaving the old pair active.
 	 */
-	apply(harness: AgentHarness<any, any, any, AgentHarnessTool<TContext>>): Promise<void>;
+	apply(harness: LoopHarnessLike<LoopContextualTool<TContext>>): Promise<void>;
 }
 
 /**
@@ -115,7 +126,6 @@ export interface LoopBrowserHandle {
  * ```ts
  * const kb = attach({ browser, client });
  * const { model, tools, models } = kb.compile({ model: "openai:gpt-5.6-sol", tools: [...] });
- * const harness = new AgentHarness({ model, tools, models, activeToolNames: tools.map((t) => t.name), session });
  * ```
  */
 export function attach(options: LoopAttachOptions): LoopBrowserHandle {
@@ -160,8 +170,8 @@ export function attach(options: LoopAttachOptions): LoopBrowserHandle {
 			);
 			lastCompiled = manager;
 			const model = manager.catalog.model;
-			const tools = manager.harnessTools() as readonly AgentHarnessTool<TContext>[];
-			const activate = (harness: AgentHarness<any, any, any, any>): (() => void) => {
+			const tools = manager.harnessTools() as readonly LoopContextualTool<TContext>[];
+			const activate = (harness: LoopHarnessLike<any>): (() => void) => {
 				release?.();
 				const uninstall = installLoopBehaviors(harness, manager, recovery);
 				live = manager;
@@ -191,9 +201,9 @@ export function attach(options: LoopAttachOptions): LoopBrowserHandle {
 }
 
 async function applyCompiled<TContext extends object | undefined>(
-	harness: AgentHarness<any, any, any, AgentHarnessTool<TContext>>,
+	harness: LoopHarnessLike<LoopContextualTool<TContext>>,
 	model: Model<Api>,
-	tools: readonly AgentHarnessTool<TContext>[],
+	tools: readonly LoopContextualTool<TContext>[],
 ): Promise<void> {
 	const previousModel = harness.getModel();
 	const previousTools = harness.getTools();
@@ -203,7 +213,7 @@ async function applyCompiled<TContext extends object | undefined>(
 		await harness.setTools([...tools], tools.map((tool) => tool.name));
 	} catch (error) {
 		if (transportChanged) await harness.setModel(previousModel);
-		await harness.setTools(previousTools, previousTools.map((tool) => tool.name));
+		await harness.setTools([...previousTools], previousTools.map((tool) => tool.name));
 		throw error;
 	}
 }
@@ -213,7 +223,7 @@ async function applyCompiled<TContext extends object | undefined>(
  * they are handlers on a constructed harness, not constructor options.
  */
 export function installLoopBehaviors(
-	harness: AgentHarness<any, any, any, any>,
+	harness: LoopHarnessLike<any>,
 	manager: LoopToolManager<any>,
 	recovery: LoopEmptyResponseRecoveryOptions | undefined,
 ): () => void {
@@ -235,7 +245,11 @@ export function installLoopBehaviors(
 		return undefined;
 	}));
 	offs.push(harness.subscribe(async (event: any, signal?: AbortSignal) => {
-		if (event.type === "message_end" && event.message.role === "assistant") turnFailed = false;
+		if (event.type === "agent_start") {
+			turnFailed = false;
+			recoveryAttempts = 0;
+			hasPendingQueue = false;
+		} else if (event.type === "message_end" && event.message.role === "assistant") turnFailed = false;
 		else if (event.type === "tool_execution_end" && event.isError) turnFailed = true;
 		else if (event.type === "queue_update") hasPendingQueue = event.steer.length > 0 || event.followUp.length > 0;
 		if (!recovery || recovery.maxAttempts <= 0) return;
@@ -280,7 +294,7 @@ export function withCatalogModels(
 		imageReplayLimit,
 		requiredImageToolNames(liveManager().catalog.incoming),
 	);
-	const optionsFor = <T extends SimpleStreamOptions | undefined>(options: T): T => {
+	const optionsFor = <T extends StreamOptions | undefined>(options: T): T => {
 		const catalog = liveManager().catalog;
 		// The handle's hook and a per-request hook both run: pi's harness always
 		// sets its own `onPayload` in stream options, so preferring one would drop
@@ -299,22 +313,12 @@ export function withCatalogModels(
 			},
 		} as T;
 	};
-	return {
-		getProviders: () => models.getProviders(),
-		getProvider: (id) => models.getProvider(id),
-		getModels: (provider) => models.getModels(provider),
-		getModel: (provider, id) => models.getModel(provider, id),
-		refresh: (provider) => models.refresh(provider),
-		getAuth: (input, overrides) => models.getAuth(input as never, overrides),
-		checkAuth: (providerId) => models.checkAuth(providerId),
-		getAvailable: (providerId) => models.getAvailable(providerId),
-		login: (providerId, type, interaction) => models.login(providerId, type, interaction),
-		logout: (providerId) => models.logout(providerId),
-		stream: (model, context, options) => models.stream(model, contextFor(context), optionsFor(options)),
-		complete: (model, context, options) => models.complete(model, contextFor(context), optionsFor(options)),
+	return delegateModels(models, {
+		stream: (model, context, options) => models.stream(model, contextFor(context), optionsFor(options as StreamOptions | undefined) as typeof options),
+		complete: (model, context, options) => models.complete(model, contextFor(context), optionsFor(options as StreamOptions | undefined) as typeof options),
 		streamSimple: (model, context, options) => models.streamSimple(model, contextFor(context), optionsFor(options)),
 		completeSimple: (model, context, options) => models.completeSimple(model, contextFor(context), optionsFor(options)),
-	};
+	});
 }
 
 /** @internal */

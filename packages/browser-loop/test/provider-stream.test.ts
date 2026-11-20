@@ -19,10 +19,9 @@ vi.mock("@onkernel/browser-loop/pi", async (importOriginal) => {
 	});
 	return {
 		...actual,
-		createLoopModels: () => ({
-			...actual.createLoopModels(),
+		createLoopModels: () => actual.delegateMutableModels(actual.createLoopModels(), {
 			getProvider: (id: string) => (["anthropic", "openai", "google"].includes(id) ? echo(id) : undefined),
-		}),
+		} as never),
 	};
 });
 

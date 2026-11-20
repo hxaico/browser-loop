@@ -1,16 +1,21 @@
 import {
 	createAssistantMessageEventStream,
+	getCurrentSystemPrompt,
+	getCurrentTools,
+	resolveTranscript,
 	type Api,
 	type AssistantMessage,
-	type Context,
 	type ImageContent,
+	type JsonObject,
 	type Message,
 	type Model,
 	type StreamFunction,
 	type StreamOptions,
 	type TextContent,
 	type ThinkingLevel,
+	type Tool,
 	type ToolCall,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { GOOGLE_INTERACTIONS_API, type LoopIncomingToolPlan } from "../../../core/tool-catalog";
 import {
@@ -50,29 +55,32 @@ export const streamSimpleGoogleInteractions: StreamFunction<typeof GOOGLE_INTERA
 async function run(
 	stream: ReturnType<typeof createAssistantMessageEventStream>,
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options: GoogleInteractionsOptions | undefined,
 ): Promise<void> {
 	const output = initialAssistantMessage(model);
 	try {
 		const apiKey = options?.apiKey || process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
 		if (!apiKey) throw new Error("missing Google API key");
+		const normalized = resolveTranscript(context, false);
+		const systemPrompt = getCurrentSystemPrompt(normalized.messages);
+		const currentTools = getCurrentTools(normalized.messages);
 		const threading = responseThreadingEnabled(options)
-			? responseThreadingDelta(context.messages, GOOGLE_INTERACTIONS_API)
-			: { deltaMessages: [...context.messages] };
+			? responseThreadingDelta(normalized.messages, GOOGLE_INTERACTIONS_API)
+			: { deltaMessages: [...normalized.messages] };
 		let payload: Record<string, unknown> = {
 			model: model.id,
 			input: convertMessages(threading.deltaMessages),
 			store: true,
 			...(threading.previousResponseId ? { previous_interaction_id: threading.previousResponseId } : {}),
-			...(context.systemPrompt ? { system_instruction: context.systemPrompt } : {}),
+			...(systemPrompt ? { system_instruction: systemPrompt } : {}),
 			generation_config: {
 				max_output_tokens: options?.maxTokens ?? model.maxTokens,
 				...(options?.temperature !== undefined ? { temperature: options.temperature } : {}),
 				...(options?.reasoning ? { thinking_level: googleThinkingLevel(options.reasoning) } : {}),
 			},
 		};
-		const tools = convertTools(context);
+		const tools = convertTools(currentTools);
 		if (tools.length > 0) payload.tools = tools;
 		const transformed = await options?.onPayload?.(payload, model);
 		if (transformed !== undefined) payload = transformed as Record<string, unknown>;
@@ -101,7 +109,7 @@ async function run(
 			? interaction.steps
 			: Array.isArray(interaction.outputs) ? interaction.outputs : [];
 		const nativeToolNames = new Set(options?.loopIncomingToolPlan?.nativeToolNames ?? []);
-		const ordinaryToolNames = new Set((context.tools ?? []).map((tool) => tool.name).filter((name) => !nativeToolNames.has(name)));
+		const ordinaryToolNames = new Set(currentTools.map((tool) => tool.name).filter((name) => !nativeToolNames.has(name)));
 		for (const raw of contents) emitContent(stream, output, raw, options?.loopIncomingToolPlan, ordinaryToolNames);
 		if (output.content.some((content) => content.type === "toolCall")) output.stopReason = "toolUse";
 		if (interaction.status === "incomplete") output.stopReason = "length";
@@ -121,6 +129,7 @@ async function run(
 function convertMessages(messages: readonly Message[]): Array<Record<string, unknown>> {
 	const steps: Array<Record<string, unknown>> = [];
 	for (const message of messages) {
+		if (message.role === "system") continue;
 		if (message.role === "user") {
 			steps.push({
 				type: "user_input",
@@ -165,8 +174,8 @@ function convertMessages(messages: readonly Message[]): Array<Record<string, unk
 	return steps;
 }
 
-function convertTools(context: Context): Array<Record<string, unknown>> {
-	return (context.tools ?? []).map((tool) => ({
+function convertTools(tools: readonly Tool[]): Array<Record<string, unknown>> {
+	return tools.map((tool) => ({
 		type: "function",
 		name: tool.name,
 		description: tool.description,
@@ -200,7 +209,7 @@ function emitContent(
 		return;
 	}
 	if (raw.type !== "function_call" || typeof raw.name !== "string") return;
-	const arguments_ = isRecord(raw.arguments) ? raw.arguments : {};
+	const arguments_ = (isRecord(raw.arguments) ? raw.arguments : {}) as JsonObject;
 	const contentIndex = output.content.length;
 	const toolCall: ToolCall = {
 		type: "toolCall",

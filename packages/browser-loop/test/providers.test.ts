@@ -30,6 +30,10 @@ describe("createLoopModels", () => {
 		// model carrying OPENAI_COMPUTER_USE_API or a namespace round-trip (see
 		// requiresOpenAINamespaceAdapter).
 		expect(models.getModel("openai", "gpt-5.4")?.api).toBe("openai-responses");
+		expect(models.getModel("openai", "gpt-6-astra")?.contextWindow).toBe(1_050_000);
+		expect(models.getModel("openai", "gpt-6.2-astra")?.contextWindow).toBe(1_050_000);
+		expect(models.getModel("openai", "gpt-6.2-sol")?.contextWindow).toBe(1_050_000);
+		expect(models.getAllModels("openai").some((m) => m.id === "gpt-6.2-astra")).toBe(true);
 
 		const xaiIds = models.getModels("xai").map((m) => m.id);
 		expect(xaiIds).toContain("grok-4.3");

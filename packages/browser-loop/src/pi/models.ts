@@ -69,6 +69,11 @@ export const COMPUTER_USE_NATIVE_SURFACES: readonly {
 	readonly surfaces: readonly ComputerUseNativeSurface[];
 	readonly source: string;
 }[] = [
+	{ provider: "openai", match: { kind: "exact", id: "gpt-6-astra" }, surfaces: ["computer"], source: "https://developers.openai.com/api/docs/models/gpt-6-astra" },
+	{ provider: "openai", match: { kind: "exact", id: "gpt-6.2-astra" }, surfaces: ["computer"], source: "https://developers.openai.com/api/docs/models/gpt-6.2-astra" },
+	{ provider: "openai", match: { kind: "exact", id: "gpt-6-sol" }, surfaces: ["computer"], source: "https://developers.openai.com/api/docs/models/gpt-6-sol" },
+	{ provider: "openai", match: { kind: "exact", id: "gpt-6.1-sol" }, surfaces: ["computer"], source: "https://developers.openai.com/api/docs/models/gpt-6.1-sol" },
+	{ provider: "openai", match: { kind: "exact", id: "gpt-6.2-sol" }, surfaces: ["computer"], source: "https://developers.openai.com/api/docs/models/gpt-6.2-sol" },
 	{ provider: "openai", match: { kind: "exact", id: "gpt-5.6-sol" }, surfaces: ["computer"], source: "https://developers.openai.com/api/docs/models/gpt-5.6-sol" },
 	{ provider: "openai", match: { kind: "family", family: "gpt-5.4" }, surfaces: ["computer"], source: "https://developers.openai.com/api/docs/models/gpt-5.4" },
 	{ provider: "openai", match: { kind: "family", family: "gpt-5.4-mini" }, surfaces: ["computer"], source: "https://developers.openai.com/api/docs/models/gpt-5.4-mini" },
@@ -165,7 +170,9 @@ export function listLoopModels(provider?: LoopProvider): LoopModelInfo[] {
 	const byRef = new Map<LoopModelRef, LoopModelInfo>();
 
 	for (const p of providers) {
-		for (const model of getBuiltinModels(p as never) as Model<Api>[]) {
+		const raw = getBuiltinModels(p as never) as Model<Api>[];
+		const models = p === "openai" ? patchOpenAILoopModels(raw) : raw;
+		for (const model of models) {
 			const ref = formatLoopModelRef(p, model.id);
 			if (byRef.has(ref)) continue;
 			byRef.set(ref, {
@@ -193,8 +200,84 @@ export function listLoopModels(provider?: LoopProvider): LoopModelInfo[] {
 export function getLoopModel(ref: LoopModelRef): Model<Api> {
 	const { provider, model: modelId } = parseLoopModelRef(ref);
 	const fromRegistry = getBuiltinModel(provider as never, modelId as never) as Model<Api> | undefined;
-	if (fromRegistry) return fromRegistry;
+	if (fromRegistry) {
+		return provider === "openai" ? (patchOpenAILoopModels([fromRegistry])[0] ?? fromRegistry) : fromRegistry;
+	}
+	if (provider === "openai") {
+		const patched = patchOpenAILoopModels(getBuiltinModels("openai") as Model<Api>[]);
+		const matched = patched.find((model) => model.id === modelId);
+		if (matched) return matched;
+	}
 	return synthesizeLoopModel(provider, modelId);
+}
+
+/**
+ * Apply Loop's OpenAI GPT-6.x / 6.2 catalog patches:
+ * - Raise `contextWindow` to `1_050_000` on every `openai` `gpt-6*` entry.
+ * - Synthesize `gpt-6.2-astra` and `gpt-6.2-sol` if absent from the registry.
+ */
+export function patchOpenAILoopModels(models: readonly Model<Api>[]): Model<Api>[] {
+	const patched = models.map((model) =>
+		model.provider === "openai" && model.id.startsWith("gpt-6")
+			? { ...model, contextWindow: 1_050_000 }
+			: model,
+	);
+	const hasId = (id: string) => patched.some((model) => model.provider === "openai" && model.id === id);
+	if (!hasId("gpt-6.2-astra")) {
+		const astraBase = patched.find((model) => model.provider === "openai" && model.id === "gpt-6-astra");
+		if (astraBase) {
+			patched.push({
+				...astraBase,
+				id: "gpt-6.2-astra",
+				name: "GPT-6.2 Astra",
+				contextWindow: 1_050_000,
+				thinkingLevelMap: { ...astraBase.thinkingLevelMap, off: null },
+				cost: {
+					input: 8,
+					output: 40,
+					cacheRead: 0.4,
+					cacheWrite: 10,
+					tiers: [
+						{
+							inputTokensAbove: 272_000,
+							input: 16,
+							output: 60,
+							cacheRead: 0.8,
+							cacheWrite: 20,
+						},
+					],
+				},
+			});
+		}
+	}
+	if (!hasId("gpt-6.2-sol")) {
+		const solBase = patched.find((model) => model.provider === "openai" && model.id === "gpt-6.1-sol");
+		if (solBase) {
+			patched.push({
+				...solBase,
+				id: "gpt-6.2-sol",
+				name: "GPT-6.2 Sol",
+				contextWindow: 1_050_000,
+				thinkingLevelMap: { ...solBase.thinkingLevelMap, off: null },
+				cost: {
+					input: 2,
+					output: 10,
+					cacheRead: 0.1,
+					cacheWrite: 2.5,
+					tiers: [
+						{
+							inputTokensAbove: 272_000,
+							input: 4,
+							output: 15,
+							cacheRead: 0.2,
+							cacheWrite: 5,
+						},
+					],
+				},
+			});
+		}
+	}
+	return patched;
 }
 
 /**
@@ -209,7 +292,8 @@ export function getLoopModel(ref: LoopModelRef): Model<Api> {
  * happens to come first.
  */
 function synthesizeLoopModel(provider: LoopProvider, modelId: string): Model<Api> {
-	const siblings = getBuiltinModels(provider as never) as Model<Api>[];
+	const rawSiblings = getBuiltinModels(provider as never) as Model<Api>[];
+	const siblings = provider === "openai" ? patchOpenAILoopModels(rawSiblings) : rawSiblings;
 	if (siblings.length === 0) {
 		throw new Error(`provider "${provider}" carries no models to infer "${modelId}" from`);
 	}
@@ -238,7 +322,7 @@ export function providerForModel(model: Model<Api>): LoopProvider {
 
 /** Whether pi can defer loading this model's ordinary function tools. */
 export function modelSupportsDeferredTools(model: Model<Api>): boolean {
-	const compat = isRecord(model.compat) ? model.compat : undefined;
+	const compat = isRecord(model.compat as unknown) ? (model.compat as unknown as Record<string, unknown>) : undefined;
 	if (model.provider === "openai") return compat?.supportsToolSearch === true;
 	if (model.provider !== "anthropic" || model.id.toLowerCase().includes("haiku")) return false;
 	if (typeof compat?.supportsToolReferences === "boolean") return compat.supportsToolReferences;

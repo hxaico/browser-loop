@@ -1,18 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
 	type AssistantMessage,
-	type Context,
 	createAssistantMessageEventStream,
 	type Model,
 	type Models,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import {
 	Agent,
-	AgentHarness,
 	type AgentMessage,
 	type AgentTool,
-	InMemorySessionRepo,
-	type Session,
 	type StreamFn,
 } from "@earendil-works/pi-agent-core";
 import {
@@ -20,6 +17,8 @@ import {
 	createLoopModels,
 	getLoopModel,
 	GOOGLE_INTERACTIONS_API,
+	type LoopContextualTool,
+	type LoopHarnessLike,
 	type LoopModelInput,
 } from "../src/pi/index";
 import { type KernelBrowser, loop, type LoopHarnessTool } from "../src/index";
@@ -41,10 +40,10 @@ function assistant(model: Model<string>, content: AssistantMessage["content"] = 
 	};
 }
 
-function scriptedStream(turns: Array<(model: Model<string>) => AssistantMessage>, contexts: Context[] = []): StreamFn {
+function scriptedStream(turns: Array<(model: Model<string>) => AssistantMessage>, contexts: TranscriptContext[] = []): StreamFn {
 	let call = 0;
 	return (model, context) => {
-		contexts.push({ ...context, messages: structuredClone(context.messages), tools: context.tools?.slice() });
+		contexts.push({ ...context, messages: structuredClone(context.messages) } as TranscriptContext);
 		const stream = createAssistantMessageEventStream();
 		const message = turns[call++]?.(model) ?? assistant(model);
 		stream.push({ type: "start", partial: message });
@@ -77,33 +76,76 @@ function modelsFromStream(streamFn: StreamFn, provider = "openai"): Models {
 	return models;
 }
 
+interface SessionHarness extends LoopHarnessLike<LoopContextualTool<undefined>> {
+	modelChanges: Model<any>[];
+	prompt(input: string): Promise<void>;
+}
+
 /**
- * What a consumer does with a handle: compile a pair, hand it to a stock pi
- * harness, and recompile-then-apply to change it.
+ * What a consumer does with a handle: compile a pair, hand it to a harness over
+ * `Agent`, and recompile-then-apply to change it.
  */
 async function openSession(options: {
 	model: LoopModelInput;
 	tools: readonly LoopHarnessTool<undefined>[];
 	models?: Models;
 }): Promise<{
-	harness: AgentHarness;
-	session: Session;
+	harness: SessionHarness;
 	select: (model: LoopModelInput, tools: readonly LoopHarnessTool<undefined>[]) => Promise<void>;
 }> {
-	const session = await new InMemorySessionRepo().create();
 	const handle = attach({ browser, client, models: options.models });
 	const compiled = handle.compile({ model: options.model, tools: options.tools });
-	const harness = new AgentHarness({
-		session,
-		model: compiled.model,
-		models: compiled.models,
-		tools: [...compiled.tools],
-		activeToolNames: compiled.tools.map((tool) => tool.name),
+	let currentTools = [...compiled.tools];
+	const modelChanges: Model<any>[] = [];
+	const handlers = new Map<string, Set<(...args: any[]) => any>>();
+	const emitSync = (event: string, payload: unknown): Record<string, unknown> | undefined => {
+		for (const handler of handlers.get(event) ?? []) {
+			const result = handler(payload);
+			if (result !== undefined) return result as Record<string, unknown>;
+		}
+		return undefined;
+	};
+	const agent = new Agent({
+		streamFn: (model, context, streamOptions) => compiled.models.streamSimple(model, context, streamOptions),
+		initialState: {
+			model: compiled.model,
+			tools: currentTools as unknown as AgentTool[],
+			systemPrompt: "",
+		},
+		beforeToolCall: async ({ toolCall }) => emitSync("tool_call", { toolName: toolCall.name }) as any,
+		afterToolCall: async ({ toolCall, result, isError }) =>
+			emitSync("tool_result", { toolName: toolCall.name, content: result.content, details: result.details, isError }) as any,
 	});
+	const harness: SessionHarness = {
+		modelChanges,
+		getModel: () => agent.state.model,
+		setModel: (model) => {
+			modelChanges.push(model);
+			agent.state.model = model;
+		},
+		getTools: () => currentTools,
+		setTools: (tools) => {
+			currentTools = [...tools];
+			agent.state.tools = currentTools as unknown as AgentTool[];
+		},
+		on: (event, handler) => {
+			const set = handlers.get(event) ?? new Set();
+			set.add(handler);
+			handlers.set(event, set);
+			return () => set.delete(handler);
+		},
+		subscribe: (listener) => agent.subscribe((event, signal) => listener(event, signal)),
+		followUp: (message) => {
+			agent.followUp({ role: "user", content: message, timestamp: Date.now() });
+		},
+		prompt: async (input) => {
+			for (const handler of handlers.get("before_agent_start") ?? []) handler();
+			await agent.prompt(input);
+		},
+	};
 	compiled.activate(harness);
 	return {
 		harness,
-		session,
 		select: async (model, tools) => {
 			const next = handle.compile({ model, tools });
 			await next.apply(harness);
@@ -159,7 +201,7 @@ describe("compiling a pair", () => {
 	});
 
 	it("retains protocol-required OpenAI native computer screenshot results outside the image replay limit", async () => {
-		const contexts: Context[] = [];
+		const contexts: TranscriptContext[] = [];
 		const model = getLoopModel("openai:gpt-5.5");
 		const image = { type: "image" as const, data: "c2NyZWVuc2hvdA==", mimeType: "image/png" };
 		const messages: AgentMessage[] = [
@@ -210,15 +252,15 @@ describe("applying a pair to a live harness", () => {
 	});
 
 	it("records no model change when the derived transport is unchanged", async () => {
-		const { session, select } = await openSession({ model: "openai:gpt-5.5", tools: [callerTool("first")] });
+		const { harness, select } = await openSession({ model: "openai:gpt-5.5", tools: [callerTool("first")] });
 
 		await select("openai:gpt-5.5", [callerTool("second")]);
 
-		expect((await session.getBranch()).filter((entry) => entry.type === "model_change")).toEqual([]);
+		expect(harness.modelChanges).toEqual([]);
 	});
 
 	it("records one model change for a switch that moves both the model and its transport", async () => {
-		const { harness, session, select } = await openSession({
+		const { harness, select } = await openSession({
 			model: "google:gemini-3.6-flash",
 			tools: loop.providers.google.toolsets.browser(),
 		});
@@ -227,7 +269,7 @@ describe("applying a pair to a live harness", () => {
 		await select("openai:gpt-5.5", [loop.tools.browser.snapshot()]);
 		expect(harness.getModel().api).toBe("openai-responses");
 
-		expect((await session.getBranch()).filter((entry) => entry.type === "model_change")).toHaveLength(1);
+		expect(harness.modelChanges).toHaveLength(1);
 	});
 
 	it("ignores a release from a pair that is no longer live", async () => {
@@ -237,23 +279,20 @@ describe("applying a pair to a live harness", () => {
 			seen.push(model);
 			return script(model, context, options);
 		}, "google");
-		const session = await new InMemorySessionRepo().create();
 		const handle = attach({ browser, client, models });
-		const first = handle.compile({ model: "google:gemini-3.6-flash", tools: [loop.tools.browser.snapshot()] });
-		const harness = new AgentHarness({
-			session,
-			model: first.model,
-			models: first.models,
-			tools: [...first.tools],
-			activeToolNames: first.tools.map((tool) => tool.name),
+		const { harness } = await openSession({
+			model: "google:gemini-3.6-flash",
+			tools: [loop.tools.browser.snapshot()],
+			models,
 		});
+		const first = handle.compile({ model: "google:gemini-3.6-flash", tools: [loop.tools.browser.snapshot()] });
 		const releaseFirst = first.activate(harness);
 
 		// Count what each activation registers on the harness and what it takes
 		// back, so a leaked pair of handlers is visible.
 		let live = 0;
 		const on = harness.on.bind(harness);
-		harness.on = ((type: never, handler: never) => {
+		harness.on = ((type: string, handler: (...args: any[]) => any) => {
 			live += 1;
 			const off = on(type, handler);
 			return () => {
@@ -262,7 +301,7 @@ describe("applying a pair to a live harness", () => {
 			};
 		}) as typeof harness.on;
 		const subscribe = harness.subscribe.bind(harness);
-		harness.subscribe = ((listener: never) => {
+		harness.subscribe = ((listener: (event: any, signal?: AbortSignal) => Promise<void> | void) => {
 			live += 1;
 			const off = subscribe(listener);
 			return () => {

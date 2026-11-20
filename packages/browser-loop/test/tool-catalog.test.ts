@@ -1,4 +1,5 @@
-import { type Tool, Type } from "@earendil-works/pi-ai";
+import type { Tool } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { getLoopModel, GOOGLE_INTERACTIONS_API, OPENAI_COMPUTER_USE_API } from "../src/pi/index";
 import { callerToolIdentity, compileLoopToolCatalog, loop, type LoopToolSpec } from "../src/index";
@@ -461,5 +462,28 @@ describe("Gemini function-declaration schema", () => {
 		const raw = { tools: [{ functionDeclarations: [{ name: "browser_wait_for", parameters: catalog.toolDeclarations[0]!.parameters }] }] };
 		const sent = JSON.stringify(await catalog.payload.apply(raw, catalog.model));
 		expect(sent).toContain('"const"');
+	});
+
+	it("preserves cache_control when replacing an Anthropic native tool placeholder", async () => {
+		const catalog = compile("anthropic:claude-opus-5", [loop.providers.anthropic.tools.computer()]);
+		const raw = {
+			tools: [
+				{
+					name: "computer",
+					description: "placeholder",
+					input_schema: { type: "object" },
+					cache_control: { type: "ephemeral", ttl: "1h" },
+				},
+			],
+		};
+		const transformed = (await catalog.payload.apply(raw, catalog.model)) as {
+			tools: Array<Record<string, unknown>>;
+		};
+		expect(transformed.tools).toEqual([
+			{
+				type: "computer_toolset_20260801",
+				cache_control: { type: "ephemeral", ttl: "1h" },
+			},
+		]);
 	});
 });

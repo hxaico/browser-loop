@@ -97,7 +97,7 @@ describe("Loop model refs", () => {
 		expect(kimi.baseUrl).toBe("https://api.moonshot.ai/v1");
 		expect(kimi.input).toContain("image");
 		expect(kimi.contextWindow).toBe(1_048_576);
-		expect(kimi.maxTokens).toBe(131_072);
+		expect(kimi.maxTokens).toBe(1_048_576);
 		// Pi's K3 metadata maps low/high/max and clamps the rest away.
 		expect(kimi.thinkingLevelMap?.low).toBe("low");
 		expect(kimi.thinkingLevelMap?.high).toBe("high");
@@ -159,10 +159,47 @@ describe("native surfaces", () => {
 		expect(computerUseNativeSurfaces(getLoopModel("openai:gpt-5.5"))).toEqual(["computer"]);
 		expect(computerUseNativeSurfaces(getLoopModel("openai:gpt-5.5-2026-04-23"))).toEqual(["computer"]);
 		expect(computerUseNativeSurfaces(getLoopModel("openai:gpt-5.4-mini"))).toEqual(["computer"]);
+		expect(computerUseNativeSurfaces(getLoopModel("openai:gpt-6-astra"))).toEqual(["computer"]);
+		expect(computerUseNativeSurfaces(getLoopModel("openai:gpt-6.2-astra"))).toEqual(["computer"]);
+		expect(computerUseNativeSurfaces(getLoopModel("openai:gpt-6-sol"))).toEqual(["computer"]);
+		expect(computerUseNativeSurfaces(getLoopModel("openai:gpt-6.1-sol"))).toEqual(["computer"]);
+		expect(computerUseNativeSurfaces(getLoopModel("openai:gpt-6.2-sol"))).toEqual(["computer"]);
 		expect(computerUseNativeSurfaces(getLoopModel("anthropic:claude-opus-5"))).toEqual(["computer", "browser"]);
 		expect(computerUseNativeSurfaces(getLoopModel("anthropic:claude-opus-5-20260724"))).toEqual(["computer", "browser"]);
 		expect(computerUseNativeSurfaces(getLoopModel("anthropic:claude-fable-5"))).toEqual(["computer", "browser"]);
 		expect(computerUseNativeSurfaces(getLoopModel("anthropic:claude-mythos-5"))).toEqual(["computer", "browser"]);
+		expect(COMPUTER_USE_NATIVE_SURFACES.some((entry) => entry.provider === "anthropic")).toBe(false);
+	});
+
+	it("patches OpenAI GPT-6.x context windows to 1,050,000 and synthesizes GPT-6.2 models", () => {
+		for (const id of ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna", "gpt-6.2-astra", "gpt-6.2-sol"]) {
+			const model = getLoopModel(`openai:${id}`);
+			expect(model.contextWindow, id).toBe(1_050_000);
+			expect(model.maxTokens, id).toBe(128_000);
+		}
+		const astra62 = getLoopModel("openai:gpt-6.2-astra");
+		expect(astra62.cost).toEqual({
+			input: 8,
+			output: 40,
+			cacheRead: 0.4,
+			cacheWrite: 10,
+			tiers: [{ inputTokensAbove: 272_000, input: 16, output: 60, cacheRead: 0.8, cacheWrite: 20 }],
+		});
+		expect(astra62.thinkingLevelMap?.off).toBeNull();
+
+		const sol62 = getLoopModel("openai:gpt-6.2-sol");
+		expect(sol62.cost).toEqual({
+			input: 2,
+			output: 10,
+			cacheRead: 0.1,
+			cacheWrite: 2.5,
+			tiers: [{ inputTokensAbove: 272_000, input: 4, output: 15, cacheRead: 0.2, cacheWrite: 5 }],
+		});
+		expect(sol62.thinkingLevelMap?.off).toBeNull();
+
+		const listed = listLoopModels("openai");
+		expect(listed.find((entry) => entry.model === "gpt-6.2-astra")?.nativeSurfaces).toEqual(["computer"]);
+		expect(listed.find((entry) => entry.model === "gpt-6.2-sol")?.nativeSurfaces).toEqual(["computer"]);
 	});
 
 	it("does not match adjacent families or named sibling variants", () => {

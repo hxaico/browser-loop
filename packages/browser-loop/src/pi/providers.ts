@@ -1,20 +1,31 @@
 import {
-	createProvider,
 	envApiKeyAuth,
+	isModelType,
 	type Api,
-	type Context,
 	type CreateModelsOptions,
 	type Model,
 	type MutableModels,
 	type Provider,
 	type SimpleStreamOptions,
 	type StreamOptions,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { loopApiKeyEnvVarsForProvider } from "./api-keys";
+import { patchOpenAILoopModels } from "./models";
 import { withAnthropicToolsets } from "./providers/anthropic/toolsets";
 import { GOOGLE_INTERACTIONS_API, streamGoogleInteractions, streamSimpleGoogleInteractions } from "./providers/google/provider";
-import { OPENAI_COMPUTER_USE_API, requiresOpenAINamespaceAdapter, streamOpenAIComputerUse, streamOpenAIResponses, streamSimpleOpenAIResponses } from "./providers/openai/provider";
+import {
+	isOpenAIPlatformBaseUrl,
+	OPENAI_COMPUTER_USE_API,
+	streamOpenAIComputerUse,
+	streamOpenAIResponses,
+	streamSimpleOpenAIResponses,
+	type LoopOpenAISimpleStreamOptions,
+	type OpenAIPromptCacheOptions,
+	type OpenAIPromptCacheTtl,
+	type OpenAIResponsesOptions,
+} from "./providers/openai/provider";
 
 /**
  * Build the pi `Models` collection Loop streams through: pi's builtin
@@ -22,12 +33,10 @@ import { OPENAI_COMPUTER_USE_API, requiresOpenAINamespaceAdapter, streamOpenAICo
  *
  * - `anthropic` adapts pi's function-tool transcript to the computer and
  *   browser client-toolset protocol, including member names and toolset results.
- * - `openai` streams through pi's builtin `openai-responses` transport and its
- *   automatic prompt caching by default; a model compiled with OpenAI's native
- *   computer tool carries `openai-computer-use` instead, which this wrapper
- *   routes to the Loop adapter. The one dispatch that cannot be derived from
- *   `model.api` is a transcript carrying a deferred tool-search addition or a
- *   replayed function-call namespace (see {@link requiresOpenAINamespaceAdapter}).
+ * - `openai` patches Loop's GPT-6.x / 6.2 catalog overrides, wraps pi's builtin
+ *   `openai-responses` transport for platform-gated explicit prompt-cache
+ *   breakpoints and `"ultrafast"` pricing, and routes models compiled onto
+ *   `openai-computer-use` to Loop's native computer adapter.
  * - `google` intercepts `google-interactions` — carried only by a model
  *   compiled with Google's native computer-use toolset — for current native
  *   computer use, and resolves API keys from `GOOGLE_API_KEY` or `GEMINI_API_KEY`.
@@ -65,23 +74,26 @@ export function loopModels(): MutableModels {
 	return (defaultLoopModels ??= createLoopModels());
 }
 
-// The compiled catalog's model.api decides dispatch: OPENAI_COMPUTER_USE_API
-// routes to the Loop adapter, everything else falls through to pi's builtin
-// "openai-responses" provider. requiresOpenAINamespaceAdapter is the one
-// exception that cannot be derived from the model — see its doc comment.
 function withOpenAIComputerUseAdapter(base: Provider): Provider {
 	return {
 		...base,
-		stream: (model: Model<Api>, context: Context, options?: StreamOptions) =>
+		getModels: () => patchOpenAILoopModels(base.getModels()),
+		getAllModels: () => {
+			const all = base.getAllModels?.() ?? base.getModels();
+			const chat = all.filter((model): model is Model<Api> => isModelType(model, "chat"));
+			const nonChat = all.filter((model) => !isModelType(model, "chat"));
+			return [...patchOpenAILoopModels(chat), ...nonChat];
+		},
+		stream: (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) =>
 			model.api === OPENAI_COMPUTER_USE_API
 				? streamOpenAIComputerUse(model as never, context, options)
-				: requiresOpenAINamespaceAdapter(context)
+				: model.api === "openai-responses"
 					? streamOpenAIResponses(model as never, context, options)
 					: base.stream(model, context, options),
-		streamSimple: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) =>
+		streamSimple: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) =>
 			model.api === OPENAI_COMPUTER_USE_API
 				? streamOpenAIComputerUse(model as never, context, options)
-				: requiresOpenAINamespaceAdapter(context)
+				: model.api === "openai-responses"
 					? streamSimpleOpenAIResponses(model as never, context, options)
 					: base.streamSimple(model, context, options),
 	};
@@ -91,18 +103,25 @@ function withGoogleInteractions(base: Provider): Provider {
 	return {
 		...base,
 		auth: { ...base.auth, apiKey: envApiKeyAuth("Google API key", loopApiKeyEnvVarsForProvider("google")) },
-		stream: (model: Model<Api>, context: Context, options?: StreamOptions) =>
+		stream: (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) =>
 			model.api === GOOGLE_INTERACTIONS_API
 				? streamGoogleInteractions(model as never, context, options)
 				: base.stream(model, context, options),
-		streamSimple: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) =>
+		streamSimple: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) =>
 			model.api === GOOGLE_INTERACTIONS_API
 				? streamSimpleGoogleInteractions(model as never, context, options)
 				: base.streamSimple(model, context, options),
 	};
 }
 
-
-
 export { GOOGLE_INTERACTIONS_API, streamGoogleInteractions, streamSimpleGoogleInteractions };
-export { OPENAI_COMPUTER_USE_API, streamOpenAIResponses, streamSimpleOpenAIResponses };
+export {
+	isOpenAIPlatformBaseUrl,
+	OPENAI_COMPUTER_USE_API,
+	streamOpenAIResponses,
+	streamSimpleOpenAIResponses,
+	type LoopOpenAISimpleStreamOptions,
+	type OpenAIPromptCacheOptions,
+	type OpenAIPromptCacheTtl,
+	type OpenAIResponsesOptions,
+};

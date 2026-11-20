@@ -3,13 +3,19 @@ export * from "./models";
 export {
 	createLoopModels,
 	GOOGLE_INTERACTIONS_API,
+	isOpenAIPlatformBaseUrl,
 	loopModels,
 	OPENAI_COMPUTER_USE_API,
 	streamGoogleInteractions,
 	streamOpenAIResponses,
 	streamSimpleGoogleInteractions,
 	streamSimpleOpenAIResponses,
+	type LoopOpenAISimpleStreamOptions,
+	type OpenAIPromptCacheOptions,
+	type OpenAIPromptCacheTtl,
+	type OpenAIResponsesOptions,
 } from "./providers";
+export { delegateModels, delegateMutableModels } from "./models-delegate";
 export type {
 	LoopSimpleStreamOptions,
 	ResponseThreadingOptions,
@@ -24,7 +30,9 @@ export type {
 	LoopBrowserHandle,
 	LoopCompiled,
 	LoopEmptyResponseRecoveryOptions,
+	LoopHarnessLike,
 	LoopModelInput,
 	ToolResultImageReplayLimit,
 } from "./attach";
+export type { LoopAgentTool, LoopContextualTool, LoopHarnessTool } from "./tool-manager";
 export type { LoopRetryOptions } from "./provider-retry";
