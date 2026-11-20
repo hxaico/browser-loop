@@ -1351,13 +1351,16 @@ export class BrowserExecutor {
 		const awaitPromise = options.awaitPromise ?? true;
 		const run = async (): Promise<{ value?: unknown; description?: string; type?: string }> => {
 			const targetId = await this.resolveTarget(options.tabId);
+			throwIfAborted(options.signal);
 			const session = await this.attach(targetId);
+			throwIfAborted(options.signal);
 			let evaluated: {
 				result: { value?: unknown; description?: string; type?: string };
 				exceptionDetails?: { text?: string; exception?: { description?: string } };
 			};
 			if (options.isolated) {
 				const { frameTree } = await this.cdp.send<{ frameTree?: FrameTreeNode }>("Page.getFrameTree", {}, session);
+				throwIfAborted(options.signal);
 				const frameId = frameTree?.frame?.id ?? this.mainFramesByTarget.get(targetId);
 				if (!frameId) throw new Error(`could not resolve the main frame for target ${targetId}`);
 				this.mainFramesByTarget.set(targetId, frameId);
@@ -1385,7 +1388,7 @@ export class BrowserExecutor {
 			}
 			return evaluated.result;
 		};
-		return raceTimeoutAndSignal(run(), options.timeoutMs, options.signal);
+		return raceTimeoutAndSignal(run, options.timeoutMs, options.signal);
 	}
 
 	private async evaluate(code: string, options: BrowserEvaluateOptions = {}): Promise<string> {
@@ -1819,11 +1822,15 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 async function raceTimeoutAndSignal<T>(
-	promise: Promise<T>,
+	start: () => Promise<T>,
 	timeoutMs: number | undefined,
 	signal: AbortSignal | undefined,
 ): Promise<T> {
 	throwIfAborted(signal);
+	if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs < 0)) {
+		throw new Error("timeoutMs must be a non-negative finite number");
+	}
+	const promise = start();
 	if (timeoutMs === undefined && !signal) return promise;
 	promise.catch(() => {});
 	return new Promise<T>((resolve, reject) => {
@@ -1842,10 +1849,6 @@ async function raceTimeoutAndSignal<T>(
 		const onAbort = () => settle(() => reject(signal?.reason instanceof Error ? signal.reason : new Error("browser action aborted")));
 		if (signal) signal.addEventListener("abort", onAbort, { once: true });
 		if (timeoutMs !== undefined) {
-			if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
-				settle(() => reject(new Error("timeoutMs must be a non-negative finite number")));
-				return;
-			}
 			timer = setTimeout(() => settle(() => reject(new Error(`browser_evaluate timed out after ${timeoutMs}ms`))), timeoutMs);
 		}
 		promise.then(

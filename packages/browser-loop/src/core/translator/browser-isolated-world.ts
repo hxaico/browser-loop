@@ -35,17 +35,26 @@ export function isStaleContextError(error: unknown): error is CdpProtocolError {
 	return error instanceof CdpProtocolError && (error.code === -32000 || error.code === -32001);
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+	if (!signal?.aborted) return;
+	throw signal.reason instanceof Error ? signal.reason : new Error("browser action aborted");
+}
+
 /**
  * Wrap arbitrary user/probe code using `node:vm` `Script` parsing so reused isolated
  * worlds never throw `const`/`let` redeclaration errors and never invoke CSP-unsafe `eval()`.
  */
 export function wrapIsolatedScript(code: string, awaitPromise = true): string {
+	const stripped = code.trim().replace(/;+$/, "");
+	const hasStripped = stripped.length > 0 && stripped !== code;
 	const candidates = [
 		`(() => (\n${code}\n))()`,
+		...(hasStripped ? [`(() => (\n${stripped}\n))()`] : []),
 		`{\n${code}\n}`,
 		`(() => {\n${code}\n})()`,
 		...(awaitPromise ? [
 			`(async () => (\n${code}\n))()`,
+			...(hasStripped ? [`(async () => (\n${stripped}\n))()`] : []),
 			`(async () => {\n${code}\n})()`,
 		] : []),
 	];
@@ -73,6 +82,7 @@ export class BrowserIsolatedWorldRegistry {
 	}
 
 	async evaluate(params: IsolatedEvaluateParams): Promise<IsolatedEvaluateResponse> {
+		throwIfAborted(params.signal);
 		const awaitPromise = params.awaitPromise ?? true;
 		const expression = params.wrap === false ? params.expression : wrapIsolatedScript(params.expression, awaitPromise);
 		const key = worldKey(params.targetId, params.sessionId, params.frameId, params.loaderId);
@@ -82,6 +92,7 @@ export class BrowserIsolatedWorldRegistry {
 			params.frameId,
 			params.loaderId,
 		);
+		throwIfAborted(params.signal);
 		try {
 			return await this.runEvaluate(params, contextId, expression, awaitPromise);
 		} catch (error) {
@@ -97,6 +108,7 @@ export class BrowserIsolatedWorldRegistry {
 				params.frameId,
 				params.loaderId,
 			);
+			throwIfAborted(params.signal);
 			return this.runEvaluate(params, freshContextId, expression, awaitPromise);
 		}
 	}

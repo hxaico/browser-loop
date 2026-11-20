@@ -278,7 +278,7 @@ describe("BrowserIsolatedWorldRegistry", () => {
 		).rejects.toMatchObject({ code: -32001 });
 		expect(fake.calls.filter((c) => c.method === "Page.getFrameTree")).toHaveLength(0);
 
-		// 4. Cached -32000 with aborted signal -> deletes cache & rethrows without retry.
+		// 4. Cached -32000 with signal aborted mid-evaluation -> deletes cache & rethrows without retry.
 		const controller = new AbortController();
 		fake.setEvaluateImpl(() => ({ result: { value: "ok" } }));
 		await registry.evaluate({
@@ -288,8 +288,8 @@ describe("BrowserIsolatedWorldRegistry", () => {
 			loaderId: "LOADER-1",
 			expression: "prime",
 		});
-		controller.abort();
 		fake.setEvaluateImpl(() => {
+			controller.abort();
 			throw new CdpProtocolError("Runtime.evaluate", -32000, "Context gone");
 		});
 		await expect(
@@ -311,6 +311,41 @@ describe("BrowserIsolatedWorldRegistry", () => {
 		expect(isStaleContextError(new CdpProtocolError("Runtime.evaluate", -32603, "Cannot find context with specified id"))).toBe(false);
 		expect(isStaleContextError(new Error("Cannot find context with specified id"))).toBe(false);
 	});
+
+	it("never invokes Runtime.evaluate when aborted before or during world creation", async () => {
+		const fake = createFakeRegistryCdp();
+		const registry = new BrowserIsolatedWorldRegistry(fake.cdp);
+
+		const alreadyAborted = new AbortController();
+		alreadyAborted.abort(new Error("already aborted"));
+		await expect(
+			registry.evaluate({
+				targetId: "TARGET-1",
+				sessionId: "SESSION-1",
+				frameId: "FRAME-1",
+				loaderId: "LOADER-1",
+				expression: "1 + 1",
+				signal: alreadyAborted.signal,
+			}),
+		).rejects.toThrow("already aborted");
+		expect(fake.calls).toHaveLength(0);
+
+		const midFlight = new AbortController();
+		fake.setCreateWorldDelay(async () => {
+			midFlight.abort(new Error("aborted during create"));
+		});
+		await expect(
+			registry.evaluate({
+				targetId: "TARGET-1",
+				sessionId: "SESSION-1",
+				frameId: "FRAME-1",
+				loaderId: "LOADER-1",
+				expression: "1 + 1",
+				signal: midFlight.signal,
+			}),
+		).rejects.toThrow("aborted during create");
+		expect(fake.calls.some((c) => c.method === "Runtime.evaluate")).toBe(false);
+	});
 });
 
 describe("wrapIsolatedScript", () => {
@@ -319,6 +354,10 @@ describe("wrapIsolatedScript", () => {
 
 		const expr = wrapIsolatedScript("{ a: 1, b: 2 }");
 		expect(vm.runInContext(expr, context)).toEqual({ a: 1, b: 2 });
+
+		// Trailing semicolons on single expressions still return their value instead of undefined.
+		const exprWithSemi = wrapIsolatedScript("{ a: 1 };");
+		expect(vm.runInContext(exprWithSemi, context)).toEqual({ a: 1 });
 
 		// Repeated const/let declarations in the same reused context must not throw SyntaxError.
 		const block = wrapIsolatedScript("const x = 40; let y = 2; x + y // trailing comment");
@@ -331,13 +370,16 @@ describe("wrapIsolatedScript", () => {
 		const asyncExpr = wrapIsolatedScript("await Promise.resolve(99)", true);
 		await expect(vm.runInContext(asyncExpr, context)).resolves.toBe(99);
 
+		const asyncExprWithSemi = wrapIsolatedScript("await Promise.resolve(99);", true);
+		await expect(vm.runInContext(asyncExprWithSemi, context)).resolves.toBe(99);
+
 		const asyncStmt = wrapIsolatedScript("const v = await Promise.resolve(7); return v + 1;", true);
 		await expect(vm.runInContext(asyncStmt, context)).resolves.toBe(8);
 
 		// When awaitPromise is false, do not synthesize an async IIFE.
 		expect(wrapIsolatedScript("await Promise.resolve(1)", false)).toBe("await Promise.resolve(1)");
 
-		for (const candidate of [expr, block, withReturn, asyncExpr, asyncStmt]) {
+		for (const candidate of [expr, exprWithSemi, block, withReturn, asyncExpr, asyncExprWithSemi, asyncStmt]) {
 			expect(candidate).not.toContain("eval(");
 		}
 	});
