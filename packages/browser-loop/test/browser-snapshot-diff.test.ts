@@ -7,8 +7,10 @@ import {
 	type BrowserAction,
 	type CdpConnection,
 	type KernelBrowser,
+	type SnapshotDiffResult,
+	type SnapshotDiffSkipReason,
 } from "../src/index";
-import { formatSnapshotDiff } from "../src/core/translator/browser-snapshot-diff";
+import { formatSnapshotDiff, formatSnapshotDiffResult } from "../src/core/translator/browser-snapshot-diff";
 
 interface AxSpec {
 	nodeId: string;
@@ -708,24 +710,42 @@ describe("BrowserExecutor hierarchical AXTree diffs", () => {
 		} as unknown as CdpConnection;
 
 		const executor = new BrowserExecutor(cdp);
-		const snap1 = (await executor.execute({ type: "browser_snapshot" } as BrowserAction))[0] as { diff: boolean; text: string };
+		const snap1 = (await executor.execute({ type: "browser_snapshot" } as BrowserAction))[0] as {
+			diff: boolean;
+			text: string;
+			diffSkipReason?: SnapshotDiffSkipReason;
+		};
 		expect(snap1.diff).toBe(false);
+		expect(snap1.diffSkipReason).toBeUndefined();
 		expect(snap1.text).toContain('button "Pay Now"');
 
-		// Iframe temporarily fails to resolve -> must fall back to full snapshot without removed_refs.
+		// Previously stitched iframe fails to resolve -> must fall back to full snapshot without removed_refs.
 		frameReady = false;
-		const snap2 = (await executor.execute({ type: "browser_snapshot", diff: true } as BrowserAction))[0] as { diff: boolean; unchanged: boolean; text: string };
+		const snap2 = (await executor.execute({ type: "browser_snapshot", diff: true } as BrowserAction))[0] as {
+			diff: boolean;
+			unchanged: boolean;
+			text: string;
+			diffSkipReason?: SnapshotDiffSkipReason;
+		};
 		expect(snap2.diff).toBe(false);
 		expect(snap2.unchanged).toBe(false);
+		expect(snap2.diffSkipReason).toBe("incomplete_frame_dropped");
 		expect(snap2.text).not.toContain("removed_refs:");
 		expect(snap2.text).not.toContain("[axtree_diff");
 
-		// Iframe recovers -> must emit full snapshot (NOT UNCHANGED_SNAPSHOT and NOT diff).
+		// Iframe recovers (Transition 2: incomplete -> stitched) -> emits incremental diff adding frame nodes.
 		frameReady = true;
-		const snap3 = (await executor.execute({ type: "browser_snapshot", diff: true } as BrowserAction))[0] as { diff: boolean; unchanged: boolean; text: string };
-		expect(snap3.diff).toBe(false);
+		const snap3 = (await executor.execute({ type: "browser_snapshot", diff: true } as BrowserAction))[0] as {
+			diff: boolean;
+			unchanged: boolean;
+			text: string;
+			diffSkipReason?: SnapshotDiffSkipReason;
+		};
+		expect(snap3.diff).toBe(true);
 		expect(snap3.unchanged).toBe(false);
+		expect(snap3.diffSkipReason).toBeUndefined();
 		expect(snap3.text).toContain('button "Pay Now"');
+		expect(snap3.text).toMatch(/^\+\s+RootWebArea "Inner"/m);
 
 		// Subsequent complete snapshot resumes diffing cleanly.
 		bannerName = "Welcome back";
@@ -733,5 +753,216 @@ describe("BrowserExecutor hierarchical AXTree diffs", () => {
 		expect(snap4.diff).toBe(true);
 		expect(snap4.text).toContain('+   StaticText "Welcome back"');
 		expect(snap4.text).toContain('-   StaticText "Welcome"');
+	});
+
+	it("allows diffing alongside persistent incomplete ad/pixel frames and collapses child-frame revision churn to UNCHANGED_SNAPSHOT", async () => {
+		const listeners: Array<(event: { method: string; params: Record<string, unknown>; sessionId?: string }) => void> = [];
+		let bannerName = "Deal 1";
+		let contentFrameAttached = true;
+		const paddingIds = Array.from({ length: 8 }, (_, i) => `pad_${i}`);
+		const mainNodes = () => [
+			ax({
+				nodeId: "root",
+				role: "RootWebArea",
+				name: "Booking",
+				childIds: [
+					"banner",
+					"ad_frame",
+					...(contentFrameAttached ? ["content_frame"] : []),
+					...paddingIds,
+				],
+			}),
+			ax({ nodeId: "banner", role: "StaticText", name: bannerName, parentId: "root" }),
+			ax({ nodeId: "ad_frame", role: "Iframe", name: "Ad Pixel", backendDOMNodeId: 99, parentId: "root" }),
+			...(contentFrameAttached
+				? [ax({ nodeId: "content_frame", role: "Iframe", name: "Checkout", backendDOMNodeId: 50, parentId: "root" })]
+				: []),
+			...paddingIds.map((id, i) =>
+				ax({ nodeId: id, role: "heading", name: `Hotel policy line ${i} for reservation`, backendDOMNodeId: 200 + i, parentId: "root" }),
+			),
+		];
+		const contentNodes = [
+			ax({ nodeId: "froot", role: "RootWebArea", name: "Checkout", childIds: ["fbtn"] }),
+			ax({ nodeId: "fbtn", role: "button", name: "Book Room", backendDOMNodeId: 501, parentId: "froot" }),
+		];
+		const cdp = {
+			onEvent(listener: (event: { method: string; params: Record<string, unknown>; sessionId?: string }) => void) {
+				listeners.push(listener);
+			},
+			onClose() {
+				return () => {};
+			},
+			async pageTargets() {
+				return [{ targetId: "TARGET-1", type: "page", title: "Booking", url: "https://shop.test/hotels" }];
+			},
+			async attachToTarget() {
+				return "session-1";
+			},
+			async send(method: string, params: Record<string, unknown> = {}) {
+				switch (method) {
+					case "Page.getFrameTree":
+						return {
+							frameTree: {
+								frame: { id: "TARGET-1", loaderId: "L1" },
+								childFrames: [{ frame: { id: "FRAME-50", loaderId: "FL50" } }],
+							},
+						};
+					case "DOM.describeNode":
+						return params.backendNodeId === 50 ? { node: { frameId: "FRAME-50" } } : { node: {} };
+					case "Accessibility.getFullAXTree":
+						return params.frameId === "FRAME-50" ? { nodes: contentNodes } : { nodes: mainNodes() };
+					case "Page.createIsolatedWorld":
+						return { executionContextId: 1 };
+					case "Runtime.evaluate":
+						if (params.returnByValue === false) return { result: { objectId: "scan" } };
+						return { result: { value: "" } };
+					case "Runtime.getProperties":
+						return { result: [{ name: "length", value: {} }] };
+					default:
+						return {};
+				}
+			},
+		} as unknown as CdpConnection;
+
+		const executor = new BrowserExecutor(cdp);
+		const snap1 = (await executor.execute({ type: "browser_snapshot", diff: true } as BrowserAction))[0] as {
+			diff: boolean;
+			diffSkipReason?: SnapshotDiffSkipReason;
+			text: string;
+		};
+		expect(snap1.diff).toBe(false);
+		expect(snap1.diffSkipReason).toBe("no_baseline");
+		expect(snap1.text).toContain('button "Book Room"');
+
+		// Transition 1: persistent incomplete ad_frame (99) does NOT block diff on main frame change.
+		bannerName = "Deal 2";
+		const snap2 = (await executor.execute({ type: "browser_snapshot", diff: true } as BrowserAction))[0] as {
+			diff: boolean;
+			diffSkipReason?: SnapshotDiffSkipReason;
+			text: string;
+		};
+		expect(snap2.diff).toBe(true);
+		expect(snap2.diffSkipReason).toBeUndefined();
+		expect(snap2.text).toContain('+   StaticText "Deal 2"');
+		expect(snap2.text).toContain('-   StaticText "Deal 1"');
+
+		// Simulate child frame navigation bumping observationRevision with 0 visible AXTree changes.
+		for (const listener of listeners) {
+			listener({
+				sessionId: "session-1",
+				method: "Page.frameNavigated",
+				params: { frame: { id: "AD-CHILD", parentId: "TARGET-1" } },
+			});
+		}
+		const snap3 = (await executor.execute({ type: "browser_snapshot", diff: true } as BrowserAction))[0] as {
+			diff: boolean;
+			unchanged: boolean;
+			diffSkipReason?: SnapshotDiffSkipReason;
+			text: string;
+		};
+		expect(snap3.unchanged).toBe(true);
+		expect(snap3.diff).toBe(false);
+		expect(snap3.diffSkipReason).toBeUndefined();
+
+		// Same revision bump with diff: false also collapses to UNCHANGED_SNAPSHOT, while force_full emits full text.
+		for (const listener of listeners) {
+			listener({
+				sessionId: "session-1",
+				method: "Page.frameDetached",
+				params: { frameId: "AD-CHILD", reason: "remove" },
+			});
+		}
+		const snap4 = (await executor.execute({ type: "browser_snapshot", diff: false } as BrowserAction))[0] as {
+			diff: boolean;
+			unchanged: boolean;
+		};
+		expect(snap4.unchanged).toBe(true);
+		expect(snap4.diff).toBe(false);
+
+		const snapForced = (await executor.execute({ type: "browser_snapshot", force_full: true, diff: true } as BrowserAction))[0] as {
+			diff: boolean;
+			unchanged: boolean;
+			diffSkipReason?: SnapshotDiffSkipReason;
+			text: string;
+		};
+		expect(snapForced.unchanged).toBe(false);
+		expect(snapForced.diff).toBe(false);
+		expect(snapForced.diffSkipReason).toBeUndefined();
+		expect(snapForced.text).toContain('button "Book Room"');
+
+		// Transition 3: genuinely closed stitched iframe emits diff removing its child refs.
+		contentFrameAttached = false;
+		const snapClosed = (await executor.execute({ type: "browser_snapshot", diff: true } as BrowserAction))[0] as {
+			diff: boolean;
+			diffSkipReason?: SnapshotDiffSkipReason;
+			text: string;
+		};
+		expect(snapClosed.diffSkipReason).toBeUndefined();
+		expect(snapClosed.diff).toBe(true);
+		expect(snapClosed.text).toContain("removed_refs:");
+		expect(snapClosed.text).toContain('button "Book Room"');
+	});
+
+	it("reports every structured SnapshotDiffSkipReason deterministically from formatSnapshotDiffResult", () => {
+		const baseNodes = [
+			{ line: 'RootWebArea "App"', depth: 0, role: "RootWebArea", name: "App", nodeKey: "k0" },
+			{ line: 'button "Save" [e1]', depth: 1, role: "button", name: "Save", parentLineIndex: 0, nodeKey: "k1", ref: "e1" },
+		];
+		const base = {
+			projectionKey: "|||cursor:0",
+			url: "https://example.com",
+			mainGeneration: 1,
+			wasTruncated: false,
+			stitchedFrameBackendIds: new Set([50]),
+			nodes: baseNodes,
+		};
+		const expectSkip = (
+			overrides: Partial<Parameters<typeof formatSnapshotDiffResult>[0]>,
+			expected: SnapshotDiffSkipReason,
+		) => {
+			const result: SnapshotDiffResult = formatSnapshotDiffResult({
+				baseline: base,
+				currentNodes: baseNodes,
+				fullText: baseNodes.map((n) => n.line).join("\n"),
+				projectionKey: "|||cursor:0",
+				url: "https://example.com",
+				mainGeneration: 1,
+				wasTruncated: false,
+				...overrides,
+			});
+			expect(result.diffText).toBeUndefined();
+			expect(result.skipReason).toBe(expected);
+		};
+
+		expectSkip({ projectionKey: "|||cursor:1" }, "projection_mismatch");
+		expectSkip({ url: "https://example.com/other" }, "url_or_gen_changed");
+		expectSkip({ mainGeneration: 2 }, "url_or_gen_changed");
+		expectSkip({ wasTruncated: true }, "truncated");
+		expectSkip({ baseline: { ...base, wasTruncated: true } }, "truncated");
+		expectSkip({ incompleteFrameBackendIds: new Set([50]) }, "incomplete_frame_dropped");
+		expectSkip({ currentNodes: [] }, "empty");
+		expectSkip({ maxDiffChangeRatio: 0 }, "invalid_max_ratio");
+		expectSkip({}, "unchanged");
+		expectSkip(
+			{
+				currentNodes: [
+					baseNodes[0]!,
+					{ line: 'button "Publish" [e2]', depth: 1, role: "button", name: "Publish", parentLineIndex: 0, nodeKey: "k2", ref: "e2" },
+				],
+				maxDiffChangeRatio: 0.4,
+			},
+			"change_ratio",
+		);
+		expectSkip(
+			{
+				currentNodes: [
+					baseNodes[0]!,
+					{ line: 'button "Publish New Draft With Extra Label" [e2]', depth: 1, role: "button", name: "Publish New Draft With Extra Label", parentLineIndex: 0, nodeKey: "k1", ref: "e2" },
+				],
+				fullText: 'RootWebArea "App"\nbutton "Save" [e1]',
+				maxDiffChangeRatio: 0.99,
+			},
+			"diff_too_large",
+		);
 	});
 });

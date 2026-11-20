@@ -51,4 +51,6 @@ export type {
 	BrowserTabState,
 	BrowserWaitForResult,
 	BrowserWaitReason,
+	SnapshotDiffSkipReason,
 } from "./core/translator/types";
+export type { SnapshotDiffResult } from "./core/translator/browser-snapshot-diff";

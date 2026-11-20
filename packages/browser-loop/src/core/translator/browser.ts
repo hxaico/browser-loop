@@ -27,7 +27,9 @@ import {
 } from "./browser-document-reconciliation";
 import { BrowserIsolatedWorldRegistry, isStaleContextError } from "./browser-isolated-world";
 import {
-	formatSnapshotDiff,
+	areSnapshotNodesIdentical,
+	formatSnapshotDiffResult,
+	hasDroppedStitchedFrame,
 	type SnapshotDiffBaseline,
 	type SnapshotDiffNode,
 } from "./browser-snapshot-diff";
@@ -61,7 +63,7 @@ import {
 	type RefEntry,
 } from "./browser-ref-lifecycle";
 import { evaluateBrowserExpectation, waitForBrowserExpectation, type BrowserExpectationEvaluation } from "./browser-wait";
-import type { BatchReadResult, BrowserActResult, BrowserState, BrowserWaitForResult } from "./types";
+import type { BatchReadResult, BrowserActResult, BrowserState, BrowserWaitForResult, SnapshotDiffSkipReason } from "./types";
 
 const SNAPSHOT_CHAR_LIMIT = 50_000;
 const DEFAULT_SNAPSHOT_DEPTH = 15;
@@ -569,7 +571,15 @@ export class BrowserExecutor {
 
 	private async snapshot(
 		action: BrowserActionSnapshot,
-	): Promise<{ text: string; url: string; title: string; targetId: string; unchanged: boolean; diff: boolean }> {
+	): Promise<{
+		text: string;
+		url: string;
+		title: string;
+		targetId: string;
+		unchanged: boolean;
+		diff: boolean;
+		diffSkipReason?: SnapshotDiffSkipReason;
+	}> {
 		return this.withObservation(action.tab_id, action.include_cursor ?? true, (observation) => {
 			const comparePrevious = !action.force_full;
 			const diff = Boolean(action.diff && !action.force_full);
@@ -585,6 +595,7 @@ export class BrowserExecutor {
 				targetId: observation.targetId,
 				unchanged: rendered.unchanged,
 				diff: rendered.diff,
+				...(rendered.diffSkipReason ? { diffSkipReason: rendered.diffSkipReason } : {}),
 			};
 		});
 	}
@@ -893,7 +904,7 @@ export class BrowserExecutor {
 	private renderObservationResult(
 		presentation: BrowserPresentation,
 		options: { comparePrevious?: boolean; diff?: boolean; maxDiffChangeRatio?: number } = {},
-	): { text: string; unchanged: boolean; diff: boolean } {
+	): { text: string; unchanged: boolean; diff: boolean; diffSkipReason?: SnapshotDiffSkipReason } {
 		const comparePrevious = options.comparePrevious ?? true;
 		const { observation, cacheKey, lines, shape } = presentation;
 		const projectionKey = presentation.projectionKey ?? cacheKey;
@@ -933,10 +944,37 @@ export class BrowserExecutor {
 		this.pruneObservationRefs(observation);
 
 		const mainGeneration = observation.generations.get(observation.targetId) ?? 0;
-		const hasIncompleteFrames = observation.incompleteFrames.length > 0;
-		const diffText =
+		const stitchedFrameBackendIds = new Set(observation.stitches.keys());
+		const incompleteFrameBackendIds = new Set(observation.incompleteFrames.map((frame) => frame.backendNodeId));
+		const nextBaseline: SnapshotBaseline = {
+			cacheKey,
+			shape,
+			projectionKey,
+			url: observation.url,
+			mainGeneration,
+			wasTruncated,
+			stitchedFrameBackendIds,
+			nodes: currentNodes,
+		};
+
+		const canCollapseUnchanged =
+			comparePrevious &&
+			cached !== undefined &&
+			cached.projectionKey === projectionKey &&
+			cached.url === observation.url &&
+			cached.mainGeneration === mainGeneration &&
+			!wasTruncated &&
+			!cached.wasTruncated &&
+			!hasDroppedStitchedFrame(cached.stitchedFrameBackendIds, incompleteFrameBackendIds) &&
+			areSnapshotNodesIdentical(cached.nodes, currentNodes);
+		if (canCollapseUnchanged) {
+			this.lastSnapshots.set(observation.targetId, nextBaseline);
+			return { text: UNCHANGED_SNAPSHOT, unchanged: true, diff: false };
+		}
+
+		const diffOutcome =
 			options.diff && cached
-				? formatSnapshotDiff({
+				? formatSnapshotDiffResult({
 						baseline: cached,
 						currentNodes,
 						fullText,
@@ -944,26 +982,27 @@ export class BrowserExecutor {
 						url: observation.url,
 						mainGeneration,
 						wasTruncated,
-						hasIncompleteFrames,
+						incompleteFrameBackendIds,
 						maxDiffChangeRatio: options.maxDiffChangeRatio,
 					})
 				: undefined;
+		const diffSkipReason: SnapshotDiffSkipReason | undefined = options.diff
+			? cached
+				? diffOutcome?.skipReason
+				: "no_baseline"
+			: undefined;
 
-		this.lastSnapshots.set(observation.targetId, {
-			cacheKey,
-			shape,
-			projectionKey,
-			url: observation.url,
-			mainGeneration,
-			wasTruncated,
-			hasIncompleteFrames,
-			nodes: currentNodes,
-		});
+		this.lastSnapshots.set(observation.targetId, nextBaseline);
 
-		if (diffText !== undefined) {
-			return { text: diffText, unchanged: false, diff: true };
+		if (diffOutcome?.diffText !== undefined) {
+			return { text: diffOutcome.diffText, unchanged: false, diff: true };
 		}
-		return { text: fullText, unchanged: false, diff: false };
+		return {
+			text: fullText,
+			unchanged: false,
+			diff: false,
+			...(diffSkipReason ? { diffSkipReason } : {}),
+		};
 	}
 
 	/** Fetch a frame's AX tree: OOPIFs through their own session, same-process frames through the page session with a frameId. */
