@@ -1,3 +1,7 @@
+import type { SnapshotDiffSkipReason } from "./types";
+
+export type { SnapshotDiffSkipReason };
+
 export const DEFAULT_MAX_DIFF_CHANGE_RATIO = 0.40;
 const MAX_DIFF_TO_FULL_LENGTH_RATIO = 0.85;
 const MAX_REMOVED_REFS = 50;
@@ -27,7 +31,7 @@ export interface SnapshotDiffBaseline {
 	readonly url: string;
 	readonly mainGeneration: number;
 	readonly wasTruncated: boolean;
-	readonly hasIncompleteFrames?: boolean;
+	readonly stitchedFrameBackendIds?: ReadonlySet<number>;
 	readonly nodes: readonly SnapshotDiffNode[];
 }
 
@@ -39,8 +43,13 @@ export interface SnapshotDiffOptions {
 	readonly url: string;
 	readonly mainGeneration: number;
 	readonly wasTruncated: boolean;
-	readonly hasIncompleteFrames?: boolean;
+	readonly incompleteFrameBackendIds?: ReadonlySet<number>;
 	readonly maxDiffChangeRatio?: number;
+}
+
+export interface SnapshotDiffResult {
+	readonly diffText?: string;
+	readonly skipReason?: SnapshotDiffSkipReason;
 }
 
 interface IndexedNode {
@@ -57,22 +66,69 @@ interface RemovedPlacement {
 }
 
 /**
- * Compute and format a hierarchical ref-preserving AXTree diff when the change
- * between baseline and current snapshot is bounded and strictly smaller than fullText.
- * Returns `undefined` when a full snapshot should be emitted instead.
+ * Returns true when an iframe that was stitched in the baseline snapshot
+ * failed collection (`incompleteFrames`) in the current snapshot.
  */
-export function formatSnapshotDiff(options: SnapshotDiffOptions): string | undefined {
-	const { baseline, currentNodes } = options;
-	if (options.wasTruncated || baseline.wasTruncated || options.hasIncompleteFrames || baseline.hasIncompleteFrames) {
-		return undefined;
+export function hasDroppedStitchedFrame(
+	stitchedFrameBackendIds: ReadonlySet<number> | undefined,
+	incompleteFrameBackendIds: ReadonlySet<number> | undefined,
+): boolean {
+	if (!stitchedFrameBackendIds || stitchedFrameBackendIds.size === 0) return false;
+	if (!incompleteFrameBackendIds || incompleteFrameBackendIds.size === 0) return false;
+	for (const id of incompleteFrameBackendIds) {
+		if (stitchedFrameBackendIds.has(id)) return true;
 	}
-	if (baseline.projectionKey !== options.projectionKey) return undefined;
-	if (baseline.url !== options.url || baseline.mainGeneration !== options.mainGeneration) return undefined;
-	if (currentNodes.length === 0 || baseline.nodes.length === 0) return undefined;
+	return false;
+}
 
+/**
+ * Returns true when two rendered AXTree node lists have identical keys,
+ * formatted lines (including refs), depths, and parent pointers in order.
+ */
+export function areSnapshotNodesIdentical(
+	before: readonly SnapshotDiffNode[],
+	after: readonly SnapshotDiffNode[],
+): boolean {
+	if (before.length !== after.length) return false;
+	for (let i = 0; i < after.length; i += 1) {
+		const a = before[i]!;
+		const b = after[i]!;
+		if (
+			a.nodeKey !== b.nodeKey ||
+			a.line !== b.line ||
+			a.depth !== b.depth ||
+			a.parentLineIndex !== b.parentLineIndex
+		) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function validateDiffPreconditions(options: SnapshotDiffOptions): SnapshotDiffSkipReason | undefined {
+	const { baseline, currentNodes } = options;
+	if (baseline.projectionKey !== options.projectionKey) return "projection_mismatch";
+	if (baseline.url !== options.url || baseline.mainGeneration !== options.mainGeneration) return "url_or_gen_changed";
+	if (options.wasTruncated || baseline.wasTruncated) return "truncated";
+	if (hasDroppedStitchedFrame(baseline.stitchedFrameBackendIds, options.incompleteFrameBackendIds)) {
+		return "incomplete_frame_dropped";
+	}
+	if (currentNodes.length === 0 || baseline.nodes.length === 0) return "empty";
 	const maxRatio = options.maxDiffChangeRatio ?? DEFAULT_MAX_DIFF_CHANGE_RATIO;
-	if (!Number.isFinite(maxRatio) || maxRatio <= 0) return undefined;
+	if (!Number.isFinite(maxRatio) || maxRatio <= 0) return "invalid_max_ratio";
+	return undefined;
+}
 
+/**
+ * Compute and format a hierarchical ref-preserving AXTree diff together with
+ * a structured skip reason whenever diffing falls back to a full snapshot.
+ */
+export function formatSnapshotDiffResult(options: SnapshotDiffOptions): SnapshotDiffResult {
+	const preconditionSkip = validateDiffPreconditions(options);
+	if (preconditionSkip) return { skipReason: preconditionSkip };
+
+	const { baseline, currentNodes } = options;
+	const maxRatio = options.maxDiffChangeRatio ?? DEFAULT_MAX_DIFF_CHANGE_RATIO;
 	const beforeByKey = indexNodes(baseline.nodes);
 	const afterByKey = indexNodes(currentNodes);
 
@@ -100,8 +156,9 @@ export function formatSnapshotDiff(options: SnapshotDiffOptions): string | undef
 	const reorderedIndices = markSiblingReorders(currentNodes, beforeByKey, afterByKey, modifiedIndices);
 
 	const changedCount = addedIndices.size + modifiedIndices.size + removedBeforeIndices.size;
+	if (changedCount === 0) return { skipReason: "unchanged" };
 	const changeRatio = changedCount / Math.max(baseline.nodes.length, currentNodes.length, 1);
-	if (!(changeRatio > 0 && changeRatio < maxRatio)) return undefined;
+	if (changeRatio >= maxRatio) return { skipReason: "change_ratio" };
 
 	const placement = buildRemovedPlacement(baseline.nodes, removedBeforeIndices, afterByKey);
 	const afterChildrenByParentIdx = groupChildrenByParentIdx(currentNodes);
@@ -130,8 +187,19 @@ export function formatSnapshotDiff(options: SnapshotDiffOptions): string | undef
 		...bodyLines,
 	];
 	const diffText = lines.join("\n");
-	if (diffText.length >= MAX_DIFF_TO_FULL_LENGTH_RATIO * options.fullText.length) return undefined;
-	return diffText;
+	if (diffText.length >= MAX_DIFF_TO_FULL_LENGTH_RATIO * options.fullText.length) {
+		return { skipReason: "diff_too_large" };
+	}
+	return { diffText };
+}
+
+/**
+ * Compute and format a hierarchical ref-preserving AXTree diff when the change
+ * between baseline and current snapshot is bounded and strictly smaller than fullText.
+ * Returns `undefined` when a full snapshot should be emitted instead.
+ */
+export function formatSnapshotDiff(options: SnapshotDiffOptions): string | undefined {
+	return formatSnapshotDiffResult(options).diffText;
 }
 
 function parentKeyOf(nodes: readonly SnapshotDiffNode[], index: number): string {
