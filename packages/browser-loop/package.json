@@ -1,6 +1,6 @@
 {
   "name": "@onkernel/browser-loop",
-  "version": "0.12.1",
+  "version": "0.13.0-rc.2",
   "description": "Browser tools for your agent: framework-neutral tool catalog, per-model compilation, Kernel-browser execution, and a pi binding + extension",
   "license": "MIT",
   "type": "module",
