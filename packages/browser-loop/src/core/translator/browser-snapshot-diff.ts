@@ -27,6 +27,7 @@ export interface SnapshotDiffBaseline {
 	readonly url: string;
 	readonly mainGeneration: number;
 	readonly wasTruncated: boolean;
+	readonly hasIncompleteFrames?: boolean;
 	readonly nodes: readonly SnapshotDiffNode[];
 }
 
@@ -38,6 +39,7 @@ export interface SnapshotDiffOptions {
 	readonly url: string;
 	readonly mainGeneration: number;
 	readonly wasTruncated: boolean;
+	readonly hasIncompleteFrames?: boolean;
 	readonly maxDiffChangeRatio?: number;
 }
 
@@ -61,7 +63,9 @@ interface RemovedPlacement {
  */
 export function formatSnapshotDiff(options: SnapshotDiffOptions): string | undefined {
 	const { baseline, currentNodes } = options;
-	if (options.wasTruncated || baseline.wasTruncated) return undefined;
+	if (options.wasTruncated || baseline.wasTruncated || options.hasIncompleteFrames || baseline.hasIncompleteFrames) {
+		return undefined;
+	}
 	if (baseline.projectionKey !== options.projectionKey) return undefined;
 	if (baseline.url !== options.url || baseline.mainGeneration !== options.mainGeneration) return undefined;
 	if (currentNodes.length === 0 || baseline.nodes.length === 0) return undefined;
@@ -93,7 +97,7 @@ export function formatSnapshotDiff(options: SnapshotDiffOptions): string | undef
 		if (!afterByKey.has(baseline.nodes[i]!.nodeKey)) removedBeforeIndices.add(i);
 	}
 
-	markSiblingReorders(currentNodes, beforeByKey, afterByKey, modifiedIndices);
+	const reorderedIndices = markSiblingReorders(currentNodes, beforeByKey, afterByKey, modifiedIndices);
 
 	const changedCount = addedIndices.size + modifiedIndices.size + removedBeforeIndices.size;
 	const changeRatio = changedCount / Math.max(baseline.nodes.length, currentNodes.length, 1);
@@ -105,6 +109,7 @@ export function formatSnapshotDiff(options: SnapshotDiffOptions): string | undef
 		currentNodes,
 		addedIndices,
 		modifiedIndices,
+		reorderedIndices,
 		placement,
 		afterByKey,
 		afterChildrenByParentIdx,
@@ -148,7 +153,8 @@ function markSiblingReorders(
 	beforeByKey: ReadonlyMap<string, IndexedNode>,
 	afterByKey: ReadonlyMap<string, IndexedNode>,
 	modifiedIndices: Set<number>,
-): void {
+): Set<number> {
+	const reorderedIndices = new Set<number>();
 	const groups = new Map<string, Array<{ afterIdx: number; beforeIdx: number }>>();
 	for (let i = 0; i < currentNodes.length; i += 1) {
 		const afterEntry = afterByKey.get(currentNodes[i]!.nodeKey)!;
@@ -165,9 +171,14 @@ function markSiblingReorders(
 		if (group.length <= 1) continue;
 		const keepPositions = lisPositions(group.map((entry) => entry.beforeIdx));
 		for (let pos = 0; pos < group.length; pos += 1) {
-			if (!keepPositions.has(pos)) modifiedIndices.add(group[pos]!.afterIdx);
+			if (!keepPositions.has(pos)) {
+				const idx = group[pos]!.afterIdx;
+				modifiedIndices.add(idx);
+				reorderedIndices.add(idx);
+			}
 		}
 	}
+	return reorderedIndices;
 }
 
 /** O(k log k) Longest Increasing Subsequence positions. */
@@ -297,6 +308,7 @@ function computeIncludedAfterIndices(
 	currentNodes: readonly SnapshotDiffNode[],
 	addedIndices: ReadonlySet<number>,
 	modifiedIndices: ReadonlySet<number>,
+	reorderedIndices: ReadonlySet<number>,
 	placement: RemovedPlacement,
 	afterByKey: ReadonlyMap<string, IndexedNode>,
 	afterChildrenByParentIdx: ReadonlyMap<number, number[]>,
@@ -321,6 +333,14 @@ function computeIncludedAfterIndices(
 		for (const descIdx of descendants.slice(0, MAX_OPTION_CHILDREN)) {
 			included.add(descIdx);
 		}
+	}
+
+	// Include one neighboring sibling as a position anchor for each reordered node (after option expansion).
+	for (const idx of reorderedIndices) {
+		const siblings = afterChildrenByParentIdx.get(currentNodes[idx]!.parentLineIndex ?? -1) ?? [];
+		const pos = siblings.indexOf(idx);
+		if (pos > 0) included.add(siblings[pos - 1]!);
+		else if (pos >= 0 && pos + 1 < siblings.length) included.add(siblings[pos + 1]!);
 	}
 
 	// Include ALL rendered ancestors along parentLineIndex (zero hardcoded role filter).

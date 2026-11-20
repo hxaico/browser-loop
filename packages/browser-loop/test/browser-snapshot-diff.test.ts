@@ -474,4 +474,151 @@ describe("BrowserExecutor hierarchical AXTree diffs", () => {
 		expect(optGroupDiff).toBeDefined();
 		expect(optGroupDiff).toContain('        option "Overnight" [e4]');
 	});
+
+	it("anchors reordered siblings with a neighboring sibling so distinct moves produce distinct diffs", () => {
+		const refByLabel = new Map(["A", "B", "C", "D", "E", "F"].map((l, i) => [l, `e${i + 1}`]));
+		const makeRow = (label: string) => ({
+			line: `  button "Item ${label}" [${refByLabel.get(label)!}]`,
+			depth: 1,
+			role: "button",
+			name: `Item ${label}`,
+			parentLineIndex: 0,
+			nodeKey: `k_${label}`,
+			ref: refByLabel.get(label)!,
+		});
+		const makeSnapshot = (labels: string[]) => [
+			{ line: 'RootWebArea "List"', depth: 0, role: "RootWebArea", name: "List", nodeKey: "r" },
+			...labels.map((label) => makeRow(label)),
+			...Array.from({ length: 12 }, (_, i) => ({
+				line: `  StaticText "Padding row ${i} keeping change ratio small"`,
+				depth: 1,
+				role: "StaticText",
+				name: `Padding row ${i} keeping change ratio small`,
+				parentLineIndex: 0,
+				nodeKey: `pad_${i}`,
+			})),
+		];
+		const base = makeSnapshot(["A", "B", "C", "D", "E", "F"]);
+		const baseline = { projectionKey: "k", url: "https://a.test", mainGeneration: 0, wasTruncated: false, nodes: base };
+
+		const dBeforeB = makeSnapshot(["A", "D", "B", "C", "E", "F"]);
+		const diff1 = formatSnapshotDiff({
+			baseline,
+			currentNodes: dBeforeB,
+			fullText: dBeforeB.map((n) => n.line).join("\n"),
+			projectionKey: "k",
+			url: "https://a.test",
+			mainGeneration: 0,
+			wasTruncated: false,
+		})!;
+
+		const dAfterB = makeSnapshot(["A", "B", "D", "C", "E", "F"]);
+		const diff2 = formatSnapshotDiff({
+			baseline,
+			currentNodes: dAfterB,
+			fullText: dAfterB.map((n) => n.line).join("\n"),
+			projectionKey: "k",
+			url: "https://a.test",
+			mainGeneration: 0,
+			wasTruncated: false,
+		})!;
+
+		const dAtStart = makeSnapshot(["D", "A", "B", "C", "E", "F"]);
+		const diffStart = formatSnapshotDiff({
+			baseline,
+			currentNodes: dAtStart,
+			fullText: dAtStart.map((n) => n.line).join("\n"),
+			projectionKey: "k",
+			url: "https://a.test",
+			mainGeneration: 0,
+			wasTruncated: false,
+		})!;
+
+		expect(diff1).toBeDefined();
+		expect(diff2).toBeDefined();
+		expect(diffStart).toBeDefined();
+		expect(diff1).not.toBe(diff2);
+		expect(diff1).toContain('    button "Item A"');
+		expect(diff2).toContain('    button "Item B"');
+		expect(diffStart).toContain('    button "Item A"');
+		expect(diffStart.indexOf('~   button "Item D"')).toBeLessThan(diffStart.indexOf('    button "Item A"'));
+	});
+
+	it("disables diffing on incomplete frames and does not emit false UNCHANGED_SNAPSHOT on recovery", async () => {
+		let frameReady = true;
+		let bannerName = "Welcome";
+		const mainNodes = () => [
+			ax({ nodeId: "root", role: "RootWebArea", name: "Host", childIds: ["banner", "frame", "footer"] }),
+			ax({ nodeId: "banner", role: "StaticText", name: bannerName, parentId: "root" }),
+			ax({ nodeId: "frame", role: "Iframe", name: "Checkout Frame", backendDOMNodeId: 50, parentId: "root" }),
+			ax({ nodeId: "footer", role: "StaticText", name: "Footer", parentId: "root" }),
+		];
+		const frameNodes = [
+			ax({ nodeId: "froot", role: "RootWebArea", name: "Inner", childIds: ["fbtn"] }),
+			ax({ nodeId: "fbtn", role: "button", name: "Pay Now", backendDOMNodeId: 501, parentId: "froot" }),
+		];
+		const cdp = {
+			onEvent() {},
+			onClose() {
+				return () => {};
+			},
+			async pageTargets() {
+				return [{ targetId: "TARGET-1", type: "page", title: "Host", url: "https://shop.test/pay" }];
+			},
+			async attachToTarget() {
+				return "session-1";
+			},
+			async send(method: string, params: Record<string, unknown> = {}) {
+				switch (method) {
+					case "Page.getFrameTree":
+						return {
+							frameTree: {
+								frame: { id: "TARGET-1", loaderId: "L1" },
+								childFrames: [{ frame: { id: "FRAME-1", loaderId: "FL1" } }],
+							},
+						};
+					case "DOM.describeNode":
+						return frameReady ? { node: { frameId: "FRAME-1" } } : { node: {} };
+					case "Accessibility.getFullAXTree":
+						return params.frameId === "FRAME-1" ? { nodes: frameNodes } : { nodes: mainNodes() };
+					case "Page.createIsolatedWorld":
+						return { executionContextId: 1 };
+					case "Runtime.evaluate":
+						if (params.returnByValue === false) return { result: { objectId: "scan" } };
+						return { result: { value: "" } };
+					case "Runtime.getProperties":
+						return { result: [{ name: "length", value: {} }] };
+					default:
+						return {};
+				}
+			},
+		} as unknown as CdpConnection;
+
+		const executor = new BrowserExecutor(cdp);
+		const snap1 = (await executor.execute({ type: "browser_snapshot" } as BrowserAction))[0] as { diff: boolean; text: string };
+		expect(snap1.diff).toBe(false);
+		expect(snap1.text).toContain('button "Pay Now"');
+
+		// Iframe temporarily fails to resolve -> must fall back to full snapshot without removed_refs.
+		frameReady = false;
+		const snap2 = (await executor.execute({ type: "browser_snapshot", diff: true } as BrowserAction))[0] as { diff: boolean; unchanged: boolean; text: string };
+		expect(snap2.diff).toBe(false);
+		expect(snap2.unchanged).toBe(false);
+		expect(snap2.text).not.toContain("removed_refs:");
+		expect(snap2.text).not.toContain("[axtree_diff");
+
+		// Iframe recovers -> must emit full snapshot (NOT UNCHANGED_SNAPSHOT and NOT diff).
+		frameReady = true;
+		const snap3 = (await executor.execute({ type: "browser_snapshot", diff: true } as BrowserAction))[0] as { diff: boolean; unchanged: boolean; text: string };
+		expect(snap3.diff).toBe(false);
+		expect(snap3.unchanged).toBe(false);
+		expect(snap3.text).toContain('button "Pay Now"');
+
+		// Subsequent complete snapshot resumes diffing cleanly.
+		bannerName = "Welcome back";
+		const snap4 = (await executor.execute({ type: "browser_snapshot", diff: true } as BrowserAction))[0] as { diff: boolean; text: string };
+		expect(snap4.diff).toBe(true);
+		expect(snap4.text).toContain('+   StaticText "Welcome back"');
+		expect(snap4.text).toContain('-   StaticText "Welcome"');
+	});
 });

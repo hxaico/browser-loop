@@ -933,6 +933,7 @@ export class BrowserExecutor {
 		this.pruneObservationRefs(observation);
 
 		const mainGeneration = observation.generations.get(observation.targetId) ?? 0;
+		const hasIncompleteFrames = observation.incompleteFrames.length > 0;
 		const diffText =
 			options.diff && cached
 				? formatSnapshotDiff({
@@ -943,6 +944,7 @@ export class BrowserExecutor {
 						url: observation.url,
 						mainGeneration,
 						wasTruncated,
+						hasIncompleteFrames,
 						maxDiffChangeRatio: options.maxDiffChangeRatio,
 					})
 				: undefined;
@@ -954,6 +956,7 @@ export class BrowserExecutor {
 			url: observation.url,
 			mainGeneration,
 			wasTruncated,
+			hasIncompleteFrames,
 			nodes: currentNodes,
 		});
 
