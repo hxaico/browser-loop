@@ -45,7 +45,10 @@ function throwIfAborted(signal?: AbortSignal): void {
  * worlds never throw `const`/`let` redeclaration errors and never invoke CSP-unsafe `eval()`.
  */
 export function wrapIsolatedScript(code: string, awaitPromise = true): string {
-	const stripped = code.trim().replace(/;+$/, "");
+	const trimmed = code.trim();
+	let end = trimmed.length;
+	while (end > 0 && trimmed.charCodeAt(end - 1) === 59) end--;
+	const stripped = trimmed.slice(0, end);
 	const hasStripped = stripped.length > 0 && stripped !== code;
 	const candidates = [
 		`(() => (\n${code}\n))()`,
