@@ -605,6 +605,7 @@ function createFakeCdp(initialNodes: unknown[] = []) {
 	let autoNavigationLifecycle = true;
 	let historyNavigationMode: "load" | "bfcache" = "load";
 	let navigationSequence = 0;
+	let isolatedWorldSequence = 0;
 	const navigationHistory = { currentIndex: 1, entries: [{ id: 1, url: "https://before.test" }, { id: 2, url: "https://a.test" }, { id: 3, url: "https://after.test" }] };
 	const sessionTrees = new Map<string, Array<{ backendDOMNodeId?: number }>>();
 	const frameTrees = new Map<string, Array<{ backendDOMNodeId?: number }>>();
@@ -705,6 +706,8 @@ function createFakeCdp(initialNodes: unknown[] = []) {
 				case "DOM.resolveNode":
 					requireBackendId(params.backendNodeId, sessionId);
 					return { object: { objectId: "node-obj" } };
+				case "Page.createIsolatedWorld":
+					return { executionContextId: ++isolatedWorldSequence };
 				case "Runtime.evaluate":
 					if (params.returnByValue === false) return { result: { objectId: "cursor-scan" } };
 					return { result: { value: runtimeValue } };
@@ -2678,5 +2681,42 @@ describe("BrowserExecutor cross-process frame document identity", () => {
 		const executor = new BrowserExecutor(fake.cdp);
 		const future: BrowserRefState = { version: 2, refCounter: 0, generations: [], refs: [] };
 		expect(() => executor.importRefState(future)).toThrow(/version 2/);
+	});
+});
+
+describe("BrowserExecutor evaluateValue abort handling", () => {
+	it("never dispatches CDP commands when already aborted or invalid timeoutMs", async () => {
+		const fake = createFakeCdp(BUTTON_TREE);
+		const executor = new BrowserExecutor(fake.cdp);
+
+		const aborted = new AbortController();
+		aborted.abort(new Error("pre-aborted"));
+		await expect(executor.evaluateValue("1 + 1", { signal: aborted.signal })).rejects.toThrow("pre-aborted");
+		expect(fake.sent).toHaveLength(0);
+
+		await expect(executor.evaluateValue("1 + 1", { timeoutMs: -1 })).rejects.toThrow("timeoutMs must be a non-negative finite number");
+		expect(fake.sent).toHaveLength(0);
+	});
+
+	it("never invokes Runtime.evaluate when aborted mid-flight during attach or getFrameTree", async () => {
+		const fakeAttach = createFakeCdp(BUTTON_TREE);
+		const attachController = new AbortController();
+		fakeAttach.setSendHook((method) => {
+			if (method === "Page.enable") attachController.abort(new Error("aborted on attach"));
+		});
+		const attachExecutor = new BrowserExecutor(fakeAttach.cdp);
+		await expect(attachExecutor.evaluateValue("1 + 1", { signal: attachController.signal })).rejects.toThrow("aborted on attach");
+		expect(fakeAttach.sent.some((cmd) => cmd.method === "Runtime.evaluate")).toBe(false);
+
+		const fakeFrameTree = createFakeCdp(BUTTON_TREE);
+		const frameController = new AbortController();
+		fakeFrameTree.setSendHook((method) => {
+			if (method === "Page.getFrameTree") frameController.abort(new Error("aborted on frameTree"));
+		});
+		const frameExecutor = new BrowserExecutor(fakeFrameTree.cdp);
+		await expect(
+			frameExecutor.evaluateValue("1 + 1", { isolated: true, signal: frameController.signal }),
+		).rejects.toThrow("aborted on frameTree");
+		expect(fakeFrameTree.sent.some((cmd) => cmd.method === "Runtime.evaluate")).toBe(false);
 	});
 });

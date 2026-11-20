@@ -48,6 +48,7 @@ export interface BrowserActionSnapshot {
 	filter?: "all" | "interactive";
 	ref?: string;
 	depth?: number;
+	include_cursor?: boolean;
 	tab_id?: string;
 }
 
@@ -235,12 +236,17 @@ export interface BrowserActionScreenshot {
 	type: "browser_screenshot";
 	/** Optional crop region, [x0, y0, x1, y1] in viewport pixels. */
 	region?: [number, number, number, number];
+	format?: "png" | "jpeg";
+	quality?: number;
 	tab_id?: string;
 }
 
 export interface BrowserActionEvaluate {
 	type: "browser_evaluate";
 	code: string;
+	isolated?: boolean;
+	await_promise?: boolean;
+	timeout_ms?: number;
 	tab_id?: string;
 }
 
@@ -390,6 +396,7 @@ export function createBrowserActionSchemaByType(options: BrowserActionSchemaOpti
 				filter: Type.Optional(Type.Union([Type.Literal("all"), Type.Literal("interactive")])),
 				ref: Type.Optional(Type.String({ description: "Restrict the snapshot to the subtree rooted at this element reference." })),
 				depth: Type.Optional(Type.Number({ description: "Maximum tree depth (default 15)." })),
+				include_cursor: Type.Optional(Type.Boolean({ description: "Include cursor:pointer clickable hints (default true)." })),
 				tab_id: TabId(),
 			},
 			{ additionalProperties: false },
@@ -547,6 +554,8 @@ export function createBrowserActionSchemaByType(options: BrowserActionSchemaOpti
 						description: "Optional crop region, [x0, y0, x1, y1] in viewport pixels.",
 					}),
 				),
+				format: Type.Optional(Type.Union([Type.Literal("png"), Type.Literal("jpeg")], { description: "Image encoding format (default \"png\")." })),
+				quality: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "JPEG quality (1–100, default 85). Ignored for PNG." })),
 				tab_id: TabId(),
 			},
 			{ additionalProperties: false },
@@ -555,6 +564,9 @@ export function createBrowserActionSchemaByType(options: BrowserActionSchemaOpti
 			{
 				type: Type.Literal("browser_evaluate"),
 				code: Type.String({ description: "JavaScript to evaluate in the page context. The value of the last expression is returned." }),
+				isolated: Type.Optional(Type.Boolean({ description: "Evaluate in a cached isolated world without touching page globals (default false)." })),
+				await_promise: Type.Optional(Type.Boolean({ description: "Await a returned promise before returning (default true)." })),
+				timeout_ms: Type.Optional(Type.Number({ minimum: 1, maximum: 300_000, description: "Optional evaluation timeout in milliseconds." })),
 				tab_id: TabId(),
 			},
 			{ additionalProperties: false },
