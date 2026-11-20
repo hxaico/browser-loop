@@ -23,7 +23,7 @@ models and need their own entry. Each cites first-party documentation.
 | provider | models | surfaces |
 | --- | --- | --- |
 | `anthropic` | `claude-fable-5`, `claude-mythos-5`, `claude-opus-4-8`, `claude-opus-5`, `claude-sonnet-5` families | computer, browser |
-| `openai` | `gpt-5.6-sol`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5` | computer |
+| `openai` | `gpt-6-astra`, `gpt-6.2-astra`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol`, `gpt-5.6-sol`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5` | computer |
 | `google` | `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-2.5-computer-use-preview-10-2025` | browser |
 
 Anthropic's entries live in `src/pi/providers/anthropic/capabilities.ts`, which is

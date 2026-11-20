@@ -1,5 +1,5 @@
-import type { AgentHarnessTool, AgentTool } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { AgentTool, AgentToolParams, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
+import type { Api, Model, Tool } from "@earendil-works/pi-ai";
 import { loopModelPreparationTransforms } from "./catalog";
 import { getLoopModel, loopModelFacts, type LoopModelRef } from "./models";
 import {
@@ -13,6 +13,30 @@ import {
 import { LoopExecutionResources, type LoopExecutableTool } from "../core/resources";
 
 /**
+ * Structural tool contract for harness/contextual runners: identical to pi's
+ * `AgentTool`, with an optional 5th `context` parameter delivered per call.
+ * Plain `AgentTool` values are assignable because they ignore the 5th argument.
+ */
+export interface LoopContextualTool<
+	TContext extends object | undefined = undefined,
+	TParameters extends object = object,
+	TDetails = any,
+> extends Tool<TParameters> {
+	label: string;
+	prepareArguments?: (args: unknown) => AgentToolParams<TParameters>;
+	outputSchema?: object;
+	execute: (
+		toolCallId: string,
+		params: AgentToolParams<TParameters>,
+		signal: AbortSignal | undefined,
+		onUpdate: AgentToolUpdateCallback<TDetails> | undefined,
+		context: TContext,
+	) => Promise<AgentToolResult<TDetails>>;
+	replay?: "never" | "safe";
+	executionMode?: AgentTool["executionMode"];
+}
+
+/**
  * Caller-owned tool: a declarative Loop spec materialized by this package, or an
  * already executable pi `AgentTool`. Defined here because the tool manager is the
  * only place that holds both halves; the catalog compiler stays declaration-only.
@@ -20,11 +44,11 @@ import { LoopExecutionResources, type LoopExecutableTool } from "../core/resourc
 export type LoopAgentTool = LoopToolSpec | AgentTool;
 
 /**
- * Caller-owned tool for a harness: a declarative Loop spec, or an executable pi
- * `AgentHarnessTool` that receives the harness's tool context on every call. A
- * plain `AgentTool` is assignable, since it simply ignores the context.
+ * Caller-owned tool for a harness: a declarative Loop spec, or an executable
+ * {@link LoopContextualTool} that receives the harness's tool context on every
+ * call. A plain `AgentTool` is assignable, since it simply ignores the context.
  */
-export type LoopHarnessTool<TContext extends object | undefined = never> = LoopToolSpec | AgentHarnessTool<TContext>;
+export type LoopHarnessTool<TContext extends object | undefined = never> = LoopToolSpec | LoopContextualTool<TContext>;
 
 /**
  * One compiled (model, tools) pair: the caller's list joined back to its
@@ -37,7 +61,7 @@ export type LoopHarnessTool<TContext extends object | undefined = never> = LoopT
  */
 export class LoopToolManager<TRequested extends LoopHarnessTool<any> = LoopAgentTool> {
 	readonly catalog: LoopToolCatalog<Model<Api>>;
-	private readonly executables: readonly (AgentTool | AgentHarnessTool<any>)[];
+	private readonly executables: readonly (AgentTool | LoopContextualTool<any>)[];
 	private readonly specs: ReadonlyMap<string, LoopToolSpec>;
 
 	constructor(
@@ -74,7 +98,7 @@ export class LoopToolManager<TRequested extends LoopHarnessTool<any> = LoopAgent
 			const executable = executables.get(entry.identity);
 			if (!executable) throw new Error(`compiled catalog entry "${entry.identity}" has no matching requested tool`);
 			executables.delete(entry.identity);
-			return isLoopToolSpec(executable) ? asAgentTool(resources.materialize(executable)) : (executable as AgentHarnessTool<any>);
+			return isLoopToolSpec(executable) ? asAgentTool(resources.materialize(executable)) : (executable as LoopContextualTool<any>);
 		});
 		if (executables.size > 0) {
 			throw new Error(`requested tool(s) ${[...executables.keys()].join(", ")} missing from the compiled catalog`);
@@ -87,9 +111,9 @@ export class LoopToolManager<TRequested extends LoopHarnessTool<any> = LoopAgent
 		return [...(this.executables as readonly AgentTool[])];
 	}
 
-	/** Context-delivering pi `AgentHarnessTool` view, in catalog entry order. */
-	harnessTools(): AgentHarnessTool<any>[] {
-		return [...(this.executables as readonly AgentHarnessTool<any>[])];
+	/** Context-delivering {@link LoopContextualTool} view, in catalog entry order. */
+	harnessTools(): LoopContextualTool<any>[] {
+		return [...(this.executables as readonly LoopContextualTool<any>[])];
 	}
 
 	/** Execution metadata for one catalog identity. */

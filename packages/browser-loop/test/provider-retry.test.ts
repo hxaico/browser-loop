@@ -1,14 +1,17 @@
 import {
 	createAssistantMessageEventStream,
+	normalizeContext,
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type Context,
 	type Model,
 	type Models,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createLoopModels, delegateModels } from "../src/pi/index";
 import {
 	resolveProviderRetryPolicy,
 	withProviderRetry,
@@ -21,7 +24,8 @@ const model = {
 	api: "google-generative-ai",
 	contextWindow: 128_000,
 } as Model<Api>;
-const context = { messages: [] };
+const context: Context = { messages: [] };
+const transcriptContext = normalizeContext(context);
 
 const enabled = resolveProviderRetryPolicy({ enabled: true });
 
@@ -66,7 +70,7 @@ describe("provider retry policy", () => {
 			calls += 1;
 			return errorStream("HTTP 429: rate limited");
 		}) as StreamFn, enabled);
-		const result = retrying(model, context).result();
+		const result = retrying(model, transcriptContext).result();
 
 		for (const [delay, expectedCalls] of [[2_000, 2], [4_000, 3], [8_000, 4]] as const) {
 			await vi.advanceTimersByTimeAsync(delay - 1);
@@ -86,7 +90,7 @@ describe("provider retry policy", () => {
 			calls += 1;
 			return errorStream("HTTP 429: retry in 30s");
 		}) as StreamFn, resolveProviderRetryPolicy({ enabled: true, maxRetries: 1, baseDelayMs: 25 }));
-		const result = retrying(model, context, options).result();
+		const result = retrying(model, transcriptContext, options).result();
 		await vi.advanceTimersByTimeAsync(24);
 		expect(calls).toBe(1);
 		await vi.advanceTimersByTimeAsync(1);
@@ -103,7 +107,7 @@ describe("provider retry behavior", () => {
 			calls += 1;
 			return calls === 1 ? errorStream("HTTP 429", "discarded") : mutableTextStream();
 		}) as StreamFn, enabled);
-		const eventsPromise = collect(retrying(model, context));
+		const eventsPromise = collect(retrying(model, transcriptContext));
 		await vi.advanceTimersByTimeAsync(2_000);
 		await vi.runAllTimersAsync();
 		const events = await eventsPromise;
@@ -127,7 +131,7 @@ describe("provider retry behavior", () => {
 			calls += 1;
 			return errorStream(error);
 		}) as StreamFn, enabled);
-		expect((await retrying(model, context).result()).stopReason).toBe("error");
+		expect((await retrying(model, transcriptContext).result()).stopReason).toBe("error");
 		expect(calls).toBe(1);
 	});
 
@@ -137,7 +141,7 @@ describe("provider retry behavior", () => {
 			calls += 1;
 			return errorStream("500: input exceeds the context window");
 		}) as StreamFn, enabled);
-		await retrying(model, context).result();
+		await retrying(model, transcriptContext).result();
 		expect(calls).toBe(1);
 	});
 
@@ -147,7 +151,7 @@ describe("provider retry behavior", () => {
 			vi.useFakeTimers();
 			let calls = 0;
 			const retrying = withProviderRetry((() => (++calls === 1 ? errorStream(error) : textStream("ok"))) as StreamFn, enabled);
-			const result = retrying(model, context).result();
+			const result = retrying(model, transcriptContext).result();
 			await vi.advanceTimersByTimeAsync(2_000);
 			expect((await result).stopReason).toBe("stop");
 			expect(calls).toBe(2);
@@ -161,7 +165,7 @@ describe("provider retry behavior", () => {
 			if (++invocationCalls === 1) throw new Error("network error");
 			return textStream("ok");
 		}) as StreamFn, enabled);
-		const invocationResult = invocation(model, context).result();
+		const invocationResult = invocation(model, transcriptContext).result();
 		await vi.advanceTimersByTimeAsync(2_000);
 		expect((await invocationResult).stopReason).toBe("stop");
 
@@ -170,7 +174,7 @@ describe("provider retry behavior", () => {
 			if (++rejectionCalls === 1) throw new Error("fetch failed");
 			return textStream("ok");
 		}) as StreamFn, enabled);
-		const rejectionResult = rejection(model, context).result();
+		const rejectionResult = rejection(model, transcriptContext).result();
 		await vi.advanceTimersByTimeAsync(2_000);
 		expect((await rejectionResult).stopReason).toBe("stop");
 
@@ -179,7 +183,7 @@ describe("provider retry behavior", () => {
 			iterationCalls += 1;
 			return iterationCalls === 1 ? throwingStream("socket hang up") : textStream("ok");
 		}) as StreamFn, enabled);
-		const iterationResult = iteration(model, context).result();
+		const iterationResult = iteration(model, transcriptContext).result();
 		await vi.advanceTimersByTimeAsync(2_000);
 		expect((await iterationResult).stopReason).toBe("stop");
 	});
@@ -190,15 +194,15 @@ describe("provider retry behavior", () => {
 			calls += 1;
 			return emptyStream();
 		}) as StreamFn, enabled);
-		const malformedEvents = await collect(malformed(model, context));
+		const malformedEvents = await collect(malformed(model, transcriptContext));
 		expect(malformedEvents.at(-1)?.type).toBe("error");
-		expect((await malformed(model, context).result()).errorMessage).toContain("without a terminal event");
+		expect((await malformed(model, transcriptContext).result()).errorMessage).toContain("without a terminal event");
 
 		const unsnapshotable = withProviderRetry((() => {
 			calls += 1;
 			return uncloneableStream();
 		}) as StreamFn, enabled);
-		const stream = unsnapshotable(model, context);
+		const stream = unsnapshotable(model, transcriptContext);
 		const [events, result] = await Promise.all([collect(stream), stream.result()]);
 		expect(events.at(-1)?.type).toBe("error");
 		expect(result.stopReason).toBe("error");
@@ -207,7 +211,7 @@ describe("provider retry behavior", () => {
 
 	it("preserves a replay failure as the terminal result", async () => {
 		const retrying = withProviderRetry((() => textStream("ok")) as StreamFn, enabled);
-		const stream = retrying(model, context);
+		const stream = retrying(model, transcriptContext);
 		const push = stream.push.bind(stream);
 		let calls = 0;
 		stream.push = (event) => {
@@ -229,7 +233,7 @@ describe("provider retry behavior", () => {
 			calls += 1;
 			return errorStream("HTTP 429");
 		}) as StreamFn, enabled);
-		const first = retrying(model, context, { signal: alreadyAborted.signal });
+		const first = retrying(model, transcriptContext, { signal: alreadyAborted.signal });
 		const [firstEvents, firstResult] = await Promise.all([collect(first), first.result()]);
 		expect(firstEvents.filter((event) => event.type === "error")).toHaveLength(1);
 		expect(firstResult.stopReason).toBe("aborted");
@@ -237,7 +241,7 @@ describe("provider retry behavior", () => {
 
 		vi.useFakeTimers();
 		const controller = new AbortController();
-		const second = retrying(model, context, { signal: controller.signal });
+		const second = retrying(model, transcriptContext, { signal: controller.signal });
 		await vi.advanceTimersByTimeAsync(1);
 		controller.abort();
 		const [secondEvents, secondResult] = await Promise.all([collect(second), second.result()]);
@@ -249,7 +253,7 @@ describe("provider retry behavior", () => {
 	it("stops reading after the first terminal event", async () => {
 		let nextCalls = 0;
 		const retrying = withProviderRetry((() => terminalThenThrowStream(() => nextCalls++)) as StreamFn, enabled);
-		const stream = retrying(model, context);
+		const stream = retrying(model, transcriptContext);
 		const [events, result] = await Promise.all([collect(stream), stream.result()]);
 		expect(result.stopReason).toBe("stop");
 		expect(events.filter((event) => event.type === "done")).toHaveLength(1);
@@ -259,7 +263,8 @@ describe("provider retry behavior", () => {
 	it("wraps only Models simple paths and preserves generic delegates", async () => {
 		let simpleCalls = 0;
 		let genericCalls = 0;
-		const models = {
+		const baseModels = createLoopModels();
+		const models = delegateModels(baseModels, {
 			streamSimple: () => (++simpleCalls === 1 ? errorStream("HTTP 429") : textStream("simple")),
 			stream: () => {
 				genericCalls += 1;
@@ -269,9 +274,12 @@ describe("provider retry behavior", () => {
 				genericCalls += 1;
 				return assistant("stop");
 			},
-		} as Models;
+		});
 		vi.useFakeTimers();
 		const wrapped = withProviderRetryModels(models, enabled);
+		expect(typeof wrapped.getAuth).toBe("function");
+		expect(typeof wrapped.getAllModels).toBe("function");
+		expect(wrapped.getProviders().length).toBeGreaterThan(0);
 		const simpleResult = wrapped.completeSimple(model, context);
 		await vi.advanceTimersByTimeAsync(2_000);
 		expect((await simpleResult).content).toEqual([{ type: "text", text: "simple" }]);

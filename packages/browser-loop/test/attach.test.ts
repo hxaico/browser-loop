@@ -1,15 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
 	type AssistantMessage,
-	type Context,
 	createAssistantMessageEventStream,
+	getCurrentTools,
 	type Model,
+	type Models,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { Agent, AgentHarness, InMemorySessionRepo, type StreamFn } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentTool, type StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	attach,
 	createLoopModels,
+	delegateMutableModels,
 	GOOGLE_INTERACTIONS_API,
+	type LoopContextualTool,
+	type LoopHarnessLike,
 	type LoopSimpleStreamOptions,
 	OPENAI_COMPUTER_USE_API,
 } from "../src/pi/index";
@@ -33,15 +38,67 @@ function assistant(model: Model<string>): AssistantMessage {
 	};
 }
 
-function recordingStream(seen: { model: Model<string>; context: Context; options?: LoopSimpleStreamOptions }[]): StreamFn {
+function recordingStream(seen: { model: Model<string>; context: TranscriptContext; options?: LoopSimpleStreamOptions }[]): StreamFn {
 	return (model, context, options) => {
-		seen.push({ model, context: { ...context, tools: context.tools?.slice() }, options: options as LoopSimpleStreamOptions });
+		seen.push({ model, context: { ...context, messages: [...context.messages] } as TranscriptContext, options: options as LoopSimpleStreamOptions });
 		const stream = createAssistantMessageEventStream();
 		const message = assistant(model);
 		stream.push({ type: "start", partial: message });
 		stream.push({ type: "done", reason: "stop", message });
 		stream.end(message);
 		return stream;
+	};
+}
+
+function createAgentHarness(options: {
+	model: Model<any>;
+	models: Models;
+	tools: readonly LoopContextualTool<undefined>[];
+}): LoopHarnessLike<LoopContextualTool<undefined>> & { prompt(input: string): Promise<void> } {
+	let currentTools = [...options.tools];
+	const handlers = new Map<string, Set<(...args: any[]) => any>>();
+	const emitSync = (event: string, payload: unknown): Record<string, unknown> | undefined => {
+		for (const handler of handlers.get(event) ?? []) {
+			const result = handler(payload);
+			if (result !== undefined) return result as Record<string, unknown>;
+		}
+		return undefined;
+	};
+	const agent = new Agent({
+		streamFn: (model, context, streamOptions) => options.models.streamSimple(model, context, streamOptions),
+		initialState: {
+			model: options.model,
+			tools: currentTools as unknown as AgentTool[],
+			systemPrompt: "",
+		},
+		beforeToolCall: async ({ toolCall }) => emitSync("tool_call", { toolName: toolCall.name }) as any,
+		afterToolCall: async ({ toolCall, result, isError }) =>
+			emitSync("tool_result", { toolName: toolCall.name, content: result.content, details: result.details, isError }) as any,
+	});
+	return {
+		getModel: () => agent.state.model,
+		setModel: (model) => {
+			agent.state.model = model;
+		},
+		getTools: () => currentTools,
+		setTools: (tools) => {
+			currentTools = [...tools];
+			agent.state.tools = currentTools as unknown as AgentTool[];
+		},
+		on: (event, handler) => {
+			const set = handlers.get(event) ?? new Set();
+			set.add(handler);
+			handlers.set(event, set);
+			return () => set.delete(handler);
+		},
+		subscribe: (listener) => agent.subscribe((event, signal) => listener(event, signal)),
+		followUp: (message) => {
+			agent.followUp({ role: "user", content: message, timestamp: Date.now() });
+		},
+		prompt: async (input) => {
+			for (const handler of handlers.get("before_agent_start") ?? []) handler();
+			await agent.prompt(input);
+		},
 	};
 }
 
@@ -57,6 +114,7 @@ describe("attach", () => {
 		expect(compiled.tools.map((tool) => tool.name)).toEqual(["browser_snapshot", "browser_click"]);
 		expect(compiled.agentTools.every((tool) => typeof tool.execute === "function")).toBe(true);
 		expect(typeof compiled.models.streamSimple).toBe("function");
+		expect(typeof compiled.models.getAuth).toBe("function");
 	});
 
 	it("derives the transport from the selected tools", () => {
@@ -82,7 +140,7 @@ describe("attach", () => {
 	});
 
 	it("drives a plain pi Agent with no Loop agent class", async () => {
-		const seen: { model: Model<string>; context: Context; options?: LoopSimpleStreamOptions }[] = [];
+		const seen: { model: Model<string>; context: TranscriptContext; options?: LoopSimpleStreamOptions }[] = [];
 		const handle = attach({ browser, client });
 		const compiled = handle.compile({ model: "openai:gpt-5.5", tools: [loop.tools.browser.snapshot()] });
 
@@ -94,43 +152,37 @@ describe("attach", () => {
 
 		expect(seen).toHaveLength(1);
 		expect(seen[0]!.model.api).toBe("openai-responses");
-		expect(seen[0]!.context.tools?.map((tool) => tool.name)).toEqual(["browser_snapshot"]);
+		expect(getCurrentTools(seen[0]!.context.messages).map((tool) => tool.name)).toEqual(["browser_snapshot"]);
 	});
 
-	it("drives a plain pi AgentHarness, with Loop's behaviors installed", async () => {
-		const seen: { model: Model<string>; context: Context; options?: LoopSimpleStreamOptions }[] = [];
+	it("drives a LoopHarnessLike wrapper over Agent, with Loop's behaviors installed", async () => {
+		const seen: { model: Model<string>; context: TranscriptContext; options?: LoopSimpleStreamOptions }[] = [];
 		const handle = attach({ browser, client, models: modelsFromStream(recordingStream(seen)) });
 		const compiled = handle.compile({ model: "openai:gpt-5.5", tools: [loop.tools.browser.snapshot()] });
-		const session = await new InMemorySessionRepo().create();
 
-		const harness = new AgentHarness({
-			session,
+		const harness = createAgentHarness({
 			model: compiled.model,
 			models: compiled.models,
 			tools: [...compiled.tools],
-			activeToolNames: compiled.tools.map((tool) => tool.name),
 		});
 		const release = compiled.activate(harness);
 
 		await harness.prompt("go");
 		expect(seen).toHaveLength(1);
-		expect(seen[0]!.context.tools?.map((tool) => tool.name)).toEqual(["browser_snapshot"]);
+		expect(getCurrentTools(seen[0]!.context.messages).map((tool) => tool.name)).toEqual(["browser_snapshot"]);
 		expect(typeof release).toBe("function");
 		release();
 	});
 
 	it("streams the live catalog's tool plan after a swap, not the one the harness was built with", async () => {
-		const seen: { model: Model<string>; context: Context; options?: LoopSimpleStreamOptions }[] = [];
+		const seen: { model: Model<string>; context: TranscriptContext; options?: LoopSimpleStreamOptions }[] = [];
 		const handle = attach({ browser, client, models: modelsFromStream(recordingStream(seen)) });
 		const first = handle.compile({ model: "openai:gpt-5.5", tools: [loop.tools.browser.snapshot()] });
-		const session = await new InMemorySessionRepo().create();
 
-		const harness = new AgentHarness({
-			session,
+		const harness = createAgentHarness({
 			model: first.model,
 			models: first.models,
 			tools: [...first.tools],
-			activeToolNames: first.tools.map((tool) => tool.name),
 		});
 		first.activate(harness);
 
@@ -147,7 +199,7 @@ describe("attach", () => {
 	});
 
 	it("runs the handle's onPayload even when the request carries its own", async () => {
-		const seen: { model: Model<string>; context: Context; options?: LoopSimpleStreamOptions }[] = [];
+		const seen: { model: Model<string>; context: TranscriptContext; options?: LoopSimpleStreamOptions }[] = [];
 		const applied: string[] = [];
 		const handle = attach({
 			browser,
@@ -159,19 +211,14 @@ describe("attach", () => {
 			},
 		});
 		const compiled = handle.compile({ model: "openai:gpt-5.5", tools: [loop.tools.browser.snapshot()] });
-		const session = await new InMemorySessionRepo().create();
-		const harness = new AgentHarness({
-			session,
+		const harness = createAgentHarness({
 			model: compiled.model,
 			models: compiled.models,
 			tools: [...compiled.tools],
-			activeToolNames: compiled.tools.map((tool) => tool.name),
 		});
 		compiled.activate(harness);
 		await harness.prompt("go");
 
-		// pi's harness always sets its own onPayload, so the handle's hook only
-		// survives if both run.
 		await seen[0]!.options?.onPayload?.({}, compiled.model);
 		expect(applied).toEqual(["handle"]);
 	});
@@ -234,7 +281,7 @@ describe("attach", () => {
 });
 
 function modelsFromStream(streamFn: StreamFn) {
-	const models = createLoopModels();
+	const models = delegateMutableModels(createLoopModels());
 	models.setProvider({
 		id: "openai",
 		name: "scripted",

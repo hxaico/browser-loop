@@ -715,7 +715,9 @@ function replaceSerializedTool(payload: unknown, name: string, declaration: Reco
 	const tools = payload.tools.map((tool) => {
 		if (serializedToolName(tool) !== name) return tool;
 		replaced = true;
-		return declaration;
+		return isRecord(tool) && "cache_control" in tool && tool.cache_control !== undefined
+			? { ...declaration, cache_control: tool.cache_control }
+			: declaration;
 	});
 	if (!replaced) throw new Error(`native tool placeholder "${name}" was not present in the provider payload`);
 	return { ...payload, tools };

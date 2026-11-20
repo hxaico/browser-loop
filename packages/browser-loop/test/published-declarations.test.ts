@@ -23,67 +23,62 @@ import {
 } from "@onkernel/browser-loop";
 import {
 	Agent,
-	AgentHarness,
-	InMemorySessionRepo,
-	createBashTool,
-	createEditTool,
-	createReadTool,
-	createWriteTool,
-	type AgentHarnessTool,
-	type ExecutionToolContext,
 } from "@earendil-works/pi-agent-core";
-import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
-import { attach, getLoopModel } from "@onkernel/browser-loop/pi";
+import {
+	attach,
+	delegateModels,
+	getLoopModel,
+	isOpenAIPlatformBaseUrl,
+	type LoopContextualTool,
+	type LoopHarnessLike,
+	type OpenAIPromptCacheOptions,
+} from "@onkernel/browser-loop/pi";
 import type Kernel from "@onkernel/sdk";
 
 declare const browser: KernelBrowser;
 declare const client: Kernel;
 
-const toolContext: ExecutionToolContext = { env: new NodeExecutionEnv({ cwd: process.cwd() }) };
+interface CustomContext {
+	requestId: string;
+}
 
-const custom: AgentHarnessTool<ExecutionToolContext> = {
+const custom: LoopContextualTool<CustomContext> = {
 	name: "custom",
 	label: "custom",
 	description: "custom tool",
 	parameters: Type.Object({}),
 	execute: async (_toolCallId, _params, _signal, _onUpdate, context) => {
-		const delivered: ExecutionToolContext = context;
+		const delivered: CustomContext = context;
 		void delivered;
 		return { content: [{ type: "text", text: "ok" }], details: undefined };
 	},
 };
 
-const harnessTools: readonly LoopHarnessTool<ExecutionToolContext>[] = [
+const harnessTools: readonly LoopHarnessTool<CustomContext>[] = [
 	...loop.toolsets.browser(),
-	createReadTool(),
-	createBashTool(),
-	createEditTool(),
-	createWriteTool(),
 	custom,
 ];
 
 const agentTools: readonly LoopAgentTool[] = [...loop.toolsets.browser()];
 
-async function build() {
-	const session = await new InMemorySessionRepo().create();
-	const handle = attach({ browser, client });
+declare const harness: LoopHarnessLike<LoopContextualTool<CustomContext>>;
 
-	const compiled = handle.compile<ExecutionToolContext>({ model: "openai:gpt-5.6-sol", tools: harnessTools });
-	const harness = new AgentHarness<ExecutionToolContext>({
-		session,
-		model: compiled.model,
-		models: compiled.models,
-		tools: [...compiled.tools],
-		activeToolNames: compiled.tools.map((tool) => tool.name),
-		toolContext,
-	});
+async function build() {
+	const handle = attach({ browser, client });
+	const cacheOptions: OpenAIPromptCacheOptions = { mode: "explicit", ttl: "12h", prewarm: true };
+	const isPlatform: boolean = isOpenAIPlatformBaseUrl("https://api.openai.com/v1");
+	void cacheOptions;
+	void isPlatform;
+
+	const compiled = handle.compile<CustomContext>({ model: "openai:gpt-6.2-sol", tools: harnessTools });
+	const delegatedModels = delegateModels(compiled.models, {});
 	const release = compiled.activate(harness);
 	// A swap compiles for the same tool context the harness delivers.
-	await handle.compile<ExecutionToolContext>({ model: getLoopModel("openai:gpt-5.6-sol"), tools: [] }).apply(harness);
+	await handle.compile<CustomContext>({ model: getLoopModel("openai:gpt-6.2-astra"), tools: [] }).apply(harness);
 
 	const lowLevel = handle.compile({ model: "openai:gpt-5.6-sol", tools: agentTools });
 	const agent = new Agent({
-		streamFn: (model, context, options) => lowLevel.models.streamSimple(model, context, options),
+		streamFn: (model, context, options) => delegatedModels.streamSimple(model, context, options),
 		initialState: { model: lowLevel.model, tools: [...lowLevel.agentTools] },
 	});
 
@@ -158,9 +153,6 @@ describe("published declarations", () => {
 				paths: {
 					"@onkernel/browser-loop": [join(out, "index.d.ts")],
 					"@onkernel/browser-loop/pi": [join(out, "pi", "index.d.ts")],
-					// The "*" fallback resolves a package root through its package.json,
-					// but not subpath exports; map this one explicitly.
-					"@earendil-works/pi-agent-core/node": [join(repoRoot, "node_modules", "@earendil-works", "pi-agent-core", "dist", "node.d.ts")],
 					"*": ["./node_modules/*"],
 				},
 			},

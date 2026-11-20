@@ -1,4 +1,4 @@
-import type { AssistantMessage, Model, ToolCall } from "@earendil-works/pi-ai";
+import { normalizeContext, type AssistantMessage, type Model, type ToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getLoopModel } from "../src/pi/index";
 import * as google from "../src/pi/providers/google/provider";
@@ -31,11 +31,11 @@ describe("Google Interactions computer-use adapter", () => {
 		}), { status: 200, headers: { "content-type": "application/json" } }));
 		vi.stubGlobal("fetch", fetch);
 
-		const message = await google.streamGoogleInteractions(model, {
+		const message = await google.streamGoogleInteractions(model, normalizeContext({
 			systemPrompt: "Use the browser.",
 			messages: [{ role: "user", content: "click search", timestamp: 1 }],
 			tools: [clickTool],
-		}, { apiKey: "test", loopIncomingToolPlan: incoming }).result();
+		}), { apiKey: "test", loopIncomingToolPlan: incoming }).result();
 
 		expect(fetch.mock.calls[0]?.[0]).toBe("https://generativelanguage.googleapis.com/v1beta/interactions");
 		const call = message.content.find((content): content is ToolCall => content.type === "toolCall");
@@ -60,10 +60,10 @@ describe("Google Interactions computer-use adapter", () => {
 		}), { status: 200, headers: { "content-type": "application/json" } }));
 		vi.stubGlobal("fetch", fetch);
 
-		const message = await google.streamGoogleInteractions(model, {
+		const message = await google.streamGoogleInteractions(model, normalizeContext({
 			messages: [{ role: "user", content: "take a screenshot", timestamp: 1 }],
 			tools: [screenshotTool],
-		}, { apiKey: "test", loopIncomingToolPlan: screenshotIncoming }).result();
+		}), { apiKey: "test", loopIncomingToolPlan: screenshotIncoming }).result();
 
 		expect(message.stopReason).toBe("error");
 		expect(message.errorMessage).toBe(
@@ -85,10 +85,10 @@ describe("Google Interactions computer-use adapter", () => {
 			],
 		}), { status: 200, headers: { "content-type": "application/json" } })));
 
-		const message = await google.streamGoogleInteractions(model, {
+		const message = await google.streamGoogleInteractions(model, normalizeContext({
 			messages: [{ role: "user", content: "take screenshots", timestamp: 1 }],
 			tools: [screenshotTool],
-		}, { apiKey: "test", loopIncomingToolPlan: screenshotIncoming }).result();
+		}), { apiKey: "test", loopIncomingToolPlan: screenshotIncoming }).result();
 
 		expect(message.content.filter((content): content is ToolCall => content.type === "toolCall").map((call) => call.name)).toEqual([
 			"take_screenshot",
@@ -108,10 +108,10 @@ describe("Google Interactions computer-use adapter", () => {
 			steps: [{ type: "function_call", id: "call_1", name: alias, arguments: {} }],
 		}), { status: 200, headers: { "content-type": "application/json" } })));
 
-		const message = await google.streamGoogleInteractions(model, {
+		const message = await google.streamGoogleInteractions(model, normalizeContext({
 			messages: [{ role: "user", content: "click", timestamp: 1 }],
 			tools: [clickTool],
-		}, { apiKey: "test", loopIncomingToolPlan: incoming }).result();
+		}), { apiKey: "test", loopIncomingToolPlan: incoming }).result();
 
 		expect(message.stopReason).toBe("error");
 		expect(message.errorMessage).toBe(
@@ -130,10 +130,10 @@ describe("Google Interactions computer-use adapter", () => {
 			],
 		}), { status: 200, headers: { "content-type": "application/json" } })));
 
-		const message = await google.streamGoogleInteractions(model, {
+		const message = await google.streamGoogleInteractions(model, normalizeContext({
 			messages: [{ role: "user", content: "take screenshots", timestamp: 1 }],
 			tools: [screenshotTool],
-		}, { apiKey: "test", loopIncomingToolPlan: screenshotIncoming }).result();
+		}), { apiKey: "test", loopIncomingToolPlan: screenshotIncoming }).result();
 
 		expect(message.content.filter((content): content is ToolCall => content.type === "toolCall").map((call) => call.name)).toEqual([
 			"take_screenshot",
@@ -152,10 +152,10 @@ describe("Google Interactions computer-use adapter", () => {
 			],
 		}), { status: 200, headers: { "content-type": "application/json" } })));
 
-		const message = await google.streamGoogleInteractions(model, {
+		const message = await google.streamGoogleInteractions(model, normalizeContext({
 			messages: [{ role: "user", content: "call my function", timestamp: 1 }],
 			tools: [ordinaryScreenshot, screenshotTool],
-		}, { apiKey: "test", loopIncomingToolPlan: screenshotIncoming }).result();
+		}), { apiKey: "test", loopIncomingToolPlan: screenshotIncoming }).result();
 
 		expect(message.content.filter((content): content is ToolCall => content.type === "toolCall")).toEqual([
 			expect.objectContaining({ name: "screenshot", arguments: { full: true } }),
@@ -182,7 +182,7 @@ describe("Google Interactions computer-use adapter", () => {
 			timestamp: 1,
 		};
 
-		const message = await google.streamGoogleInteractions(model, {
+		const message = await google.streamGoogleInteractions(model, normalizeContext({
 			messages: [
 				{ role: "user", content: "click search", timestamp: 0 },
 				assistant,
@@ -197,7 +197,7 @@ describe("Google Interactions computer-use adapter", () => {
 				},
 			],
 			tools: [clickTool],
-		}, { apiKey: "test", loopIncomingToolPlan: incoming }).result();
+		}), { apiKey: "test", loopIncomingToolPlan: incoming }).result();
 
 		expect(message.content).toContainEqual({ type: "text", text: "Done" });
 		const request = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;

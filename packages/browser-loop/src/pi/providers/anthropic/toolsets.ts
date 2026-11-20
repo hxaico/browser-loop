@@ -4,13 +4,13 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type AssistantMessageEventStream,
-	type Context,
 	type FetchFunction,
 	type Model,
 	type Provider,
 	type SimpleStreamOptions,
 	type StreamOptions,
 	type ToolCall,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import type { BrowserState } from "../../../core/translator/types";
 import type { LoopSimpleStreamOptions } from "../common";
@@ -43,14 +43,14 @@ export function withAnthropicToolsets(base: Provider): Provider {
 
 type StartStream = (
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options?: StreamOptions | SimpleStreamOptions,
 ) => AssistantMessageEventStream;
 
 function streamWithToolsets(
 	start: StartStream,
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options: LoopSimpleStreamOptions | undefined,
 ): AssistantMessageEventStream {
 	const toolsets = options?.loopIncomingToolPlan?.anthropicToolsets ?? [];
@@ -253,7 +253,7 @@ export function rewriteAnthropicToolsetSseLine(
 	}
 }
 
-function browserStates(context: Context): Map<string, BrowserState> {
+function browserStates(context: TranscriptContext): Map<string, BrowserState> {
 	const result = new Map<string, BrowserState>();
 	for (const message of context.messages) {
 		if (message.role !== "toolResult" || !isRecord(message.details)) continue;

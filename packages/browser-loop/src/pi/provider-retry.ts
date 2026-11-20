@@ -10,7 +10,9 @@ import {
 	type Model,
 	type Models,
 	type SimpleStreamOptions,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
+import { delegateModels } from "./models-delegate";
 
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_BASE_DELAY_MS = 2_000;
@@ -35,11 +37,11 @@ interface ResolvedRetryPolicy {
 	baseDelayMs: number;
 }
 
-type RetryStreamFn = (
+type RetryStreamFn<TContext extends Context | TranscriptContext> = (
 	model: Model<Api>,
-	context: Context,
+	context: TContext,
 	options?: SimpleStreamOptions,
-) => ReturnType<typeof createAssistantMessageEventStream>;
+) => ReturnType<typeof createAssistantMessageEventStream> | Promise<ReturnType<typeof createAssistantMessageEventStream>>;
 
 export function resolveProviderRetryPolicy(options?: LoopRetryOptions): ResolvedRetryPolicy {
 	const enabled = options?.enabled ?? false;
@@ -63,9 +65,14 @@ export function resolveProviderRetryPolicy(options?: LoopRetryOptions): Resolved
 	return { enabled, maxRetries, baseDelayMs };
 }
 
-export function withProviderRetry(streamFn: StreamFn, policy: ResolvedRetryPolicy): StreamFn {
-	if (!policy.enabled || policy.maxRetries === 0) return streamFn;
-
+function retryStream<TContext extends Context | TranscriptContext>(
+	streamFn: RetryStreamFn<TContext>,
+	policy: ResolvedRetryPolicy,
+): (
+	model: Model<Api>,
+	context: TContext,
+	options?: SimpleStreamOptions,
+) => ReturnType<typeof createAssistantMessageEventStream> {
 	return (model, context, options) => {
 		const output = createAssistantMessageEventStream();
 		void runWithRetry(output, streamFn, model, context, options, policy);
@@ -73,38 +80,29 @@ export function withProviderRetry(streamFn: StreamFn, policy: ResolvedRetryPolic
 	};
 }
 
+export function withProviderRetry(streamFn: StreamFn, policy: ResolvedRetryPolicy): StreamFn {
+	if (!policy.enabled || policy.maxRetries === 0) return streamFn;
+	return retryStream<TranscriptContext>(streamFn, policy);
+}
+
 export function withProviderRetryModels(models: Models, policy: ResolvedRetryPolicy): Models {
 	if (!policy.enabled || policy.maxRetries === 0) return models;
 
-	const retryingStream = withProviderRetry(
+	const streamSimple = retryStream<Context>(
 		(model, context, options) => models.streamSimple(model, context, options),
 		policy,
 	);
-	const streamSimple: RetryStreamFn = (model, context, options) =>
-		retryingStream(model, context, options) as ReturnType<typeof createAssistantMessageEventStream>;
-	return {
-		getProviders: () => models.getProviders(),
-		getProvider: (id) => models.getProvider(id),
-		getModels: (provider) => models.getModels(provider),
-		getModel: (provider, id) => models.getModel(provider, id),
-		refresh: (provider) => models.refresh(provider),
-		getAuth: (input, overrides) => models.getAuth(input as never, overrides),
-		checkAuth: (providerId) => models.checkAuth(providerId),
-		getAvailable: (providerId) => models.getAvailable(providerId),
-		login: (providerId, type, interaction) => models.login(providerId, type, interaction),
-		logout: (providerId) => models.logout(providerId),
-		stream: (model, context, options) => models.stream(model, context, options),
-		complete: (model, context, options) => models.complete(model, context, options),
+	return delegateModels(models, {
 		streamSimple,
 		completeSimple: (model, context, options) => streamSimple(model, context, options).result(),
-	};
+	});
 }
 
-async function runWithRetry(
+async function runWithRetry<TContext extends Context | TranscriptContext>(
 	output: ReturnType<typeof createAssistantMessageEventStream>,
-	streamFn: StreamFn,
+	streamFn: RetryStreamFn<TContext>,
 	model: Model<Api>,
-	context: Context,
+	context: TContext,
 	options: SimpleStreamOptions | undefined,
 	policy: ResolvedRetryPolicy,
 ): Promise<void> {
