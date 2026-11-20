@@ -216,10 +216,14 @@ function buildRemovedPlacement(
 	afterByKey: ReadonlyMap<string, IndexedNode>,
 ): RemovedPlacement {
 	const beforeChildren = groupChildrenByParentIdx(beforeNodes);
+	const liveRefs = new Set<string>();
+	for (const entry of afterByKey.values()) {
+		if (entry.node.ref) liveRefs.add(entry.node.ref);
+	}
 	const removedRefs: string[] = [];
 	for (const idx of removedBeforeIndices) {
 		const ref = beforeNodes[idx]!.ref;
-		if (ref && removedRefs.length < MAX_REMOVED_REFS) removedRefs.push(ref);
+		if (ref && !liveRefs.has(ref) && removedRefs.length < MAX_REMOVED_REFS) removedRefs.push(ref);
 	}
 
 	const removedBeforeNodeKey = new Map<string, string[]>();
@@ -231,7 +235,7 @@ function buildRemovedPlacement(
 		const parentIdx = beforeNodes[i]!.parentLineIndex;
 		if (parentIdx !== undefined && removedBeforeIndices.has(parentIdx)) continue;
 
-		const descendants = collectDescendants(beforeChildren, i);
+		const descendants = collectDescendants(beforeChildren, i, (childIdx) => removedBeforeIndices.has(childIdx));
 		const block = descendants.length > REMOVED_SUBTREE_COLLAPSE_THRESHOLD
 			? [`- ${beforeNodes[i]!.line} (+${descendants.length} child nodes removed)`]
 			: [i, ...descendants].map((idx) => `- ${beforeNodes[idx]!.line}`);
@@ -244,8 +248,11 @@ function buildRemovedPlacement(
 		let nextSurvivingKey: string | undefined;
 		for (let s = pos + 1; s < siblings.length; s += 1) {
 			const siblingIdx = siblings[s]!;
-			if (!removedBeforeIndices.has(siblingIdx)) {
-				nextSurvivingKey = beforeNodes[siblingIdx]!.nodeKey;
+			if (removedBeforeIndices.has(siblingIdx)) continue;
+			const candidateKey = beforeNodes[siblingIdx]!.nodeKey;
+			const afterEntry = afterByKey.get(candidateKey);
+			if (afterEntry && afterEntry.parentKey === parentKey) {
+				nextSurvivingKey = candidateKey;
 				break;
 			}
 		}
@@ -260,10 +267,15 @@ function buildRemovedPlacement(
 	return { removedBeforeNodeKey, trailingRemovedByParentKey, survivingParentKeys, removedRefs };
 }
 
-function collectDescendants(childrenByParentIdx: ReadonlyMap<number, number[]>, rootIdx: number): number[] {
+function collectDescendants(
+	childrenByParentIdx: ReadonlyMap<number, number[]>,
+	rootIdx: number,
+	include?: (idx: number) => boolean,
+): number[] {
 	const result: number[] = [];
 	const visit = (idx: number) => {
 		for (const child of childrenByParentIdx.get(idx) ?? []) {
+			if (include && !include(child)) continue;
 			result.push(child);
 			visit(child);
 		}
@@ -306,9 +318,8 @@ function computeIncludedAfterIndices(
 			descendants.some((idx) => included.has(idx));
 		if (!changed) continue;
 		included.add(i);
-		const directChildren = afterChildrenByParentIdx.get(i) ?? [];
-		for (const childIdx of directChildren.slice(0, MAX_OPTION_CHILDREN)) {
-			included.add(childIdx);
+		for (const descIdx of descendants.slice(0, MAX_OPTION_CHILDREN)) {
+			included.add(descIdx);
 		}
 	}
 

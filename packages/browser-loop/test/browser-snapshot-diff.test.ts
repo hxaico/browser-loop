@@ -348,4 +348,130 @@ describe("BrowserExecutor hierarchical AXTree diffs", () => {
 			unchanged: false,
 		});
 	});
+
+	it("handles reparented surviving children, reparented siblings, healed rebound refs, and grouped options without duplicate or misplaced lines", () => {
+		const padding = Array.from({ length: 16 }, (_, i) => ({
+			line: `  StaticText "Filler line ${i} keeping change ratio small"`,
+			depth: 1,
+			role: "StaticText",
+			name: `Filler line ${i} keeping change ratio small`,
+			parentLineIndex: 0,
+			nodeKey: `pad${i}`,
+		}));
+
+		// 1. Removed wrapper with reparented surviving child + removed child beneath it:
+		//    Must NOT mark surviving child as `-` and must NOT duplicate removed grandchild.
+		const beforeUnwrap = [
+			{ line: 'RootWebArea "Page"', depth: 0, role: "RootWebArea", name: "Page", nodeKey: "r" },
+			{ line: '  generic "Loading" [e1]', depth: 1, role: "generic", name: "Loading", parentLineIndex: 0, nodeKey: "wrap", ref: "e1" },
+			{ line: '    group "Card" [e2]', depth: 2, role: "group", name: "Card", parentLineIndex: 1, nodeKey: "card", ref: "e2" },
+			{ line: '      button "Old" [e3]', depth: 3, role: "button", name: "Old", parentLineIndex: 2, nodeKey: "oldBtn", ref: "e3" },
+			...padding,
+		];
+		const afterUnwrap = [
+			{ line: 'RootWebArea "Page"', depth: 0, role: "RootWebArea", name: "Page", nodeKey: "r" },
+			{ line: '  group "Card" [e2]', depth: 1, role: "group", name: "Card", parentLineIndex: 0, nodeKey: "card", ref: "e2" },
+			...padding,
+		];
+		const unwrapDiff = formatSnapshotDiff({
+			baseline: { projectionKey: "k", url: "https://a.test", mainGeneration: 0, wasTruncated: false, nodes: beforeUnwrap },
+			currentNodes: afterUnwrap,
+			fullText: afterUnwrap.map((n) => n.line).join("\n"),
+			projectionKey: "k",
+			url: "https://a.test",
+			mainGeneration: 0,
+			wasTruncated: false,
+		})!;
+		expect(unwrapDiff).toBeDefined();
+		expect(unwrapDiff).toContain('-   generic "Loading" [e1]');
+		expect(unwrapDiff).not.toContain('-     group "Card" [e2]');
+		expect(unwrapDiff.match(/button "Old" \[e3\]/g)).toHaveLength(1);
+
+		// 2. Removed node before a sibling reparented into another container stays in original parent (not inside sibling's new parent).
+		const beforeReparentSib = [
+			{ line: 'RootWebArea "Page"', depth: 0, role: "RootWebArea", name: "Page", nodeKey: "r" },
+			{ line: '  region "Left" [e1]', depth: 1, role: "region", name: "Left", parentLineIndex: 0, nodeKey: "left", ref: "e1" },
+			{ line: '    button "Old" [e2]', depth: 2, role: "button", name: "Old", parentLineIndex: 1, nodeKey: "old", ref: "e2" },
+			{ line: '    button "Moved" [e3]', depth: 2, role: "button", name: "Moved", parentLineIndex: 1, nodeKey: "moved", ref: "e3" },
+			{ line: '  region "Right" [e4]', depth: 1, role: "region", name: "Right", parentLineIndex: 0, nodeKey: "right", ref: "e4" },
+			...padding,
+		];
+		const afterReparentSib = [
+			{ line: 'RootWebArea "Page"', depth: 0, role: "RootWebArea", name: "Page", nodeKey: "r" },
+			{ line: '  region "Left" [e1]', depth: 1, role: "region", name: "Left", parentLineIndex: 0, nodeKey: "left", ref: "e1" },
+			{ line: '  region "Right" [e4]', depth: 1, role: "region", name: "Right", parentLineIndex: 0, nodeKey: "right", ref: "e4" },
+			{ line: '    button "Moved" [e3]', depth: 2, role: "button", name: "Moved", parentLineIndex: 2, nodeKey: "moved", ref: "e3" },
+			...padding,
+		];
+		const reparentDiff = formatSnapshotDiff({
+			baseline: { projectionKey: "k", url: "https://a.test", mainGeneration: 0, wasTruncated: false, nodes: beforeReparentSib },
+			currentNodes: afterReparentSib,
+			fullText: afterReparentSib.map((n) => n.line).join("\n"),
+			projectionKey: "k",
+			url: "https://a.test",
+			mainGeneration: 0,
+			wasTruncated: false,
+		})!;
+		expect(reparentDiff).toBeDefined();
+		const leftIdx = reparentDiff.indexOf('region "Left"');
+		const oldIdx = reparentDiff.indexOf('button "Old"');
+		const rightIdx = reparentDiff.indexOf('region "Right"');
+		expect(leftIdx).toBeGreaterThan(-1);
+		expect(oldIdx).toBeGreaterThan(leftIdx);
+		expect(rightIdx).toBeGreaterThan(oldIdx);
+
+		// 3. Rebound live ref (same ref string under new backend nodeKey) is excluded from removed_refs.
+		const beforeHealed = [
+			{ line: 'RootWebArea "Page"', depth: 0, role: "RootWebArea", name: "Page", nodeKey: "r" },
+			{ line: '  button "Save" [e1]', depth: 1, role: "button", name: "Save", parentLineIndex: 0, nodeKey: "T1:0:b:10", ref: "e1" },
+			...padding,
+		];
+		const afterHealed = [
+			{ line: 'RootWebArea "Page"', depth: 0, role: "RootWebArea", name: "Page", nodeKey: "r" },
+			{ line: '  button "Save" [e1]', depth: 1, role: "button", name: "Save", parentLineIndex: 0, nodeKey: "T1:0:b:99", ref: "e1" },
+			...padding,
+		];
+		const healedDiff = formatSnapshotDiff({
+			baseline: { projectionKey: "k", url: "https://a.test", mainGeneration: 0, wasTruncated: false, nodes: beforeHealed },
+			currentNodes: afterHealed,
+			fullText: afterHealed.map((n) => n.line).join("\n"),
+			projectionKey: "k",
+			url: "https://a.test",
+			mainGeneration: 0,
+			wasTruncated: false,
+		})!;
+		expect(healedDiff).toBeDefined();
+		expect(healedDiff).not.toContain("removed_refs:");
+
+		// 4. Option-group expansion traverses nested descendants (optgroup / group wrappers).
+		const beforeOptGroup = [
+			{ line: 'RootWebArea "Page"', depth: 0, role: "RootWebArea", name: "Page", nodeKey: "r" },
+			{ line: '  combobox "Shipping" [e1]', depth: 1, role: "combobox", name: "Shipping", parentLineIndex: 0, nodeKey: "cb", ref: "e1" },
+			{ line: '    group "Domestic"', depth: 2, role: "group", name: "Domestic", parentLineIndex: 1, nodeKey: "grp" },
+			{ line: '      option "Standard" [e2] [selected]', depth: 3, role: "option", name: "Standard", parentLineIndex: 2, nodeKey: "o1", ref: "e2" },
+			{ line: '      option "Express" [e3]', depth: 3, role: "option", name: "Express", parentLineIndex: 2, nodeKey: "o2", ref: "e3" },
+			{ line: '      option "Overnight" [e4]', depth: 3, role: "option", name: "Overnight", parentLineIndex: 2, nodeKey: "o3", ref: "e4" },
+			...padding,
+		];
+		const afterOptGroup = [
+			{ line: 'RootWebArea "Page"', depth: 0, role: "RootWebArea", name: "Page", nodeKey: "r" },
+			{ line: '  combobox "Shipping" [e1]', depth: 1, role: "combobox", name: "Shipping", parentLineIndex: 0, nodeKey: "cb", ref: "e1" },
+			{ line: '    group "Domestic"', depth: 2, role: "group", name: "Domestic", parentLineIndex: 1, nodeKey: "grp" },
+			{ line: '      option "Standard" [e2]', depth: 3, role: "option", name: "Standard", parentLineIndex: 2, nodeKey: "o1", ref: "e2" },
+			{ line: '      option "Express" [e3] [selected]', depth: 3, role: "option", name: "Express", parentLineIndex: 2, nodeKey: "o2", ref: "e3" },
+			{ line: '      option "Overnight" [e4]', depth: 3, role: "option", name: "Overnight", parentLineIndex: 2, nodeKey: "o3", ref: "e4" },
+			...padding,
+		];
+		const optGroupDiff = formatSnapshotDiff({
+			baseline: { projectionKey: "k", url: "https://a.test", mainGeneration: 0, wasTruncated: false, nodes: beforeOptGroup },
+			currentNodes: afterOptGroup,
+			fullText: afterOptGroup.map((n) => n.line).join("\n"),
+			projectionKey: "k",
+			url: "https://a.test",
+			mainGeneration: 0,
+			wasTruncated: false,
+		})!;
+		expect(optGroupDiff).toBeDefined();
+		expect(optGroupDiff).toContain('        option "Overnight" [e4]');
+	});
 });
