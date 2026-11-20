@@ -25,6 +25,9 @@ function createAgentHarness(agent: Agent): LoopHarnessLike<LoopContextualTool<un
 	agent.beforeToolCall = async ({ toolCall }) => emitSync("tool_call", { toolName: toolCall.name }) as any;
 	agent.afterToolCall = async ({ toolCall, result, isError }) =>
 		emitSync("tool_result", { toolName: toolCall.name, content: result.content, details: result.details, isError }) as any;
+	agent.subscribe((event) => {
+		if (event.type === "agent_start") emitSync("before_agent_start", {});
+	});
 
 	return {
 		getModel: () => agent.state.model,

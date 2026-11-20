@@ -577,8 +577,12 @@ async function processNativeComputerStream(
 					.join("");
 				const itemId = readString(item, "id");
 				const phase = item.phase === "commentary" || item.phase === "final_answer" ? item.phase : undefined;
-				if (itemId) {
-					slot.block.textSignature = JSON.stringify({ v: 1, id: itemId, ...(phase ? { phase } : {}) });
+				if (itemId || phase) {
+					slot.block.textSignature = JSON.stringify({
+						v: 1,
+						...(itemId ? { id: itemId } : {}),
+						...(phase ? { phase } : {}),
+					});
 				}
 				stream.push({ type: "text_end", contentIndex: slot.contentIndex, content: slot.block.text, partial: output });
 				outputSlots.delete(outputIndex);
@@ -841,7 +845,12 @@ function convertNativeComputerMessages(
 				}
 				if (part.type === "text") {
 					if (part.text) {
-						items.push({ role: "assistant", content: [{ type: "output_text", text: part.text }] });
+						const phase = parseTextSignaturePhase(part.textSignature);
+						items.push({
+							role: "assistant",
+							content: [{ type: "output_text", text: part.text }],
+							...(isSameModel && phase ? { phase } : {}),
+						});
 					}
 					continue;
 				}
@@ -965,6 +974,17 @@ function convertUserContent(content: string | Array<TextContent | ImageContent>)
 	return content.map((part) => part.type === "text"
 		? { type: "input_text", text: part.text }
 		: { type: "input_image", image_url: `data:${part.mimeType};base64,${part.data}`, detail: "auto" });
+}
+
+function parseTextSignaturePhase(signature: string | undefined): "commentary" | "final_answer" | undefined {
+	if (!signature || !signature.startsWith("{")) return undefined;
+	try {
+		const parsed: unknown = JSON.parse(signature);
+		if (!isRecord(parsed) || parsed.v !== 1) return undefined;
+		return parsed.phase === "commentary" || parsed.phase === "final_answer" ? parsed.phase : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function toolCallNamespace(call: ToolCall | undefined): string | undefined {

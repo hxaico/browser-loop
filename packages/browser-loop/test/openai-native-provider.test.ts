@@ -421,4 +421,72 @@ describe("computer_call_output serialization", () => {
 		const payload = responsesCreate.mock.calls.at(-1)?.[0] as { input: Array<Record<string, unknown>> };
 		expect(payload.input).toContainEqual({ role: "assistant", content: [{ type: "output_text", text: "hi" }] });
 	});
+
+	it("preserves assistant message phase across same-model replay and omits it across models", async () => {
+		responsesCreate.mockReturnValueOnce({
+			id: "resp_phase_1",
+			usage: {},
+			output: [
+				{
+					type: "message",
+					phase: "commentary",
+					content: [{ type: "output_text", text: "checking page" }],
+				},
+				{
+					type: "message",
+					id: "msg_final",
+					phase: "final_answer",
+					content: [{ type: "output_text", text: "all set" }],
+				},
+			],
+		});
+		const first = await openai.streamOpenAIComputerUse(astra62Native, normalizeContext({
+			messages: [{ role: "user", content: "go", timestamp: 1 }],
+			tools: [{ name: "computer", description: "placeholder", parameters: { type: "object" } as never }],
+		}), { apiKey: "sk-test", loopIncomingToolPlan: incoming }).result();
+
+		expect(first.content).toEqual([
+			{ type: "text", text: "checking page", textSignature: JSON.stringify({ v: 1, phase: "commentary" }) },
+			{ type: "text", text: "all set", textSignature: JSON.stringify({ v: 1, id: "msg_final", phase: "final_answer" }) },
+		]);
+
+		responsesCreate.mockReturnValueOnce({ id: "resp_phase_2", usage: {}, output: [] });
+		await openai.streamOpenAIComputerUse(astra62Native, normalizeContext({
+			messages: [
+				{ role: "user", content: "go", timestamp: 1 },
+				first,
+				{ role: "user", content: "next", timestamp: 2 },
+			],
+			tools: [{ name: "computer", description: "placeholder", parameters: { type: "object" } as never }],
+		}), { apiKey: "sk-test", loopIncomingToolPlan: incoming }).result();
+
+		const sameModelPayload = responsesCreate.mock.calls.at(-1)?.[0] as { input: Array<Record<string, unknown>> };
+		expect(sameModelPayload.input).toContainEqual({
+			role: "assistant",
+			content: [{ type: "output_text", text: "checking page" }],
+			phase: "commentary",
+		});
+		expect(sameModelPayload.input).toContainEqual({
+			role: "assistant",
+			content: [{ type: "output_text", text: "all set" }],
+			phase: "final_answer",
+		});
+
+		responsesCreate.mockReturnValueOnce({ id: "resp_phase_3", usage: {}, output: [] });
+		await openai.streamOpenAIComputerUse(nativeModel, normalizeContext({
+			messages: [
+				{ role: "user", content: "go", timestamp: 1 },
+				first,
+				{ role: "user", content: "next", timestamp: 2 },
+			],
+			tools: [{ name: "computer", description: "placeholder", parameters: { type: "object" } as never }],
+		}), { apiKey: "sk-test", loopIncomingToolPlan: incoming }).result();
+
+		const crossModelPayload = responsesCreate.mock.calls.at(-1)?.[0] as { input: Array<Record<string, unknown>> };
+		expect(crossModelPayload.input).toContainEqual({
+			role: "assistant",
+			content: [{ type: "output_text", text: "checking page" }],
+		});
+		expect(crossModelPayload.input).not.toContainEqual(expect.objectContaining({ phase: "commentary" }));
+	});
 });

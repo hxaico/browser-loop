@@ -245,7 +245,11 @@ export function installLoopBehaviors(
 		return undefined;
 	}));
 	offs.push(harness.subscribe(async (event: any, signal?: AbortSignal) => {
-		if (event.type === "message_end" && event.message.role === "assistant") turnFailed = false;
+		if (event.type === "agent_start") {
+			turnFailed = false;
+			recoveryAttempts = 0;
+			hasPendingQueue = false;
+		} else if (event.type === "message_end" && event.message.role === "assistant") turnFailed = false;
 		else if (event.type === "tool_execution_end" && event.isError) turnFailed = true;
 		else if (event.type === "queue_update") hasPendingQueue = event.steer.length > 0 || event.followUp.length > 0;
 		if (!recovery || recovery.maxAttempts <= 0) return;

@@ -252,6 +252,32 @@ describe("attach", () => {
 		expect(attempted).toEqual(["continue", "continue"]);
 	});
 
+	it("resets empty-response recovery attempts on agent_start across prompts", async () => {
+		const attempted: string[] = [];
+		let emit!: (event: unknown, signal?: AbortSignal) => Promise<void>;
+		const stub = {
+			on: () => () => {},
+			subscribe: (handler: (event: unknown, signal?: AbortSignal) => Promise<void>) => {
+				emit = handler;
+				return () => {};
+			},
+			followUp: async (message: string) => {
+				attempted.push(message);
+			},
+		};
+		const manager = { catalog: { entries: [] }, specFor: () => undefined };
+		installLoopBehaviors(stub as never, manager as never, { followUp: "continue", maxAttempts: 1 });
+
+		const emptyTurn = { type: "turn_end", message: { role: "assistant", stopReason: "stop", content: [] } };
+		await emit({ type: "agent_start" });
+		await emit(emptyTurn);
+		await emit(emptyTurn);
+		await emit({ type: "agent_start" });
+		await emit(emptyTurn);
+
+		expect(attempted).toEqual(["continue", "continue"]);
+	});
+
 	it("uses the blocked tool's own failure-stop message", () => {
 		const entries = [
 			{ identity: "computer", name: "computer" },
