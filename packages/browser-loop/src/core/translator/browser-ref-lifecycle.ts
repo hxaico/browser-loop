@@ -104,6 +104,7 @@ export interface BrowserRefState {
 export class RefGenerationLifecycle {
 	private readonly targets = new Map<string, TargetGenerationState>();
 	private readonly frames = new Map<string, FrameGenerationState>();
+	private readonly refByNode = new Map<string, string>();
 	/** Imported, verifiable per-frame loaderIds awaiting reconciliation against the live browser; see {@link reconcileDocument}. */
 	private readonly expectedDocuments = new Map<string, string>();
 	/** Owning target of every imported ref-owning frame still awaiting reconciliation (verifiable and unverifiable alike). */
@@ -167,6 +168,31 @@ export class RefGenerationLifecycle {
 		}
 	}
 
+	findRef(targetId: string, frameId: string, generation: number, backendNodeId: number): string | undefined {
+		return this.refByNode.get(nodeRefKey(targetId, frameId, generation, backendNodeId));
+	}
+
+	touchRef(ref: string, updates: Pick<RefEntry, "sessionId" | "role" | "name" | "nth" | "cohort">): void {
+		const entry = this.refs.get(ref);
+		if (!entry) return;
+		entry.sessionId = updates.sessionId;
+		entry.role = updates.role;
+		entry.name = updates.name;
+		entry.nth = updates.nth;
+		entry.cohort = updates.cohort;
+		this.refs.delete(ref);
+		this.refs.set(ref, entry);
+	}
+
+	rebindBackendNodeId(ref: string, backendNodeId: number): void {
+		const entry = this.refs.get(ref);
+		if (!entry) return;
+		const oldKey = nodeRefKey(entry.targetId, entry.frameId, entry.generation, entry.backendNodeId);
+		if (this.refByNode.get(oldKey) === ref) this.refByNode.delete(oldKey);
+		entry.backendNodeId = backendNodeId;
+		this.refByNode.set(nodeRefKey(entry.targetId, entry.frameId, entry.generation, backendNodeId), ref);
+	}
+
 	retainRef(ref: string, entry: RefEntry): void {
 		this.deleteRef(ref);
 		if (entry.frameId === entry.targetId) {
@@ -180,12 +206,15 @@ export class RefGenerationLifecycle {
 			frame.refs += 1;
 		}
 		this.refs.set(ref, entry);
+		this.refByNode.set(nodeRefKey(entry.targetId, entry.frameId, entry.generation, entry.backendNodeId), ref);
 	}
 
 	deleteRef(ref: string): void {
 		const entry = this.refs.get(ref);
 		if (!entry) return;
 		this.refs.delete(ref);
+		const key = nodeRefKey(entry.targetId, entry.frameId, entry.generation, entry.backendNodeId);
+		if (this.refByNode.get(key) === ref) this.refByNode.delete(key);
 		if (entry.frameId === entry.targetId) return;
 		const frame = this.frames.get(entry.frameId);
 		if (!frame || frame.targetId !== entry.targetId) return;
@@ -385,6 +414,7 @@ export class RefGenerationLifecycle {
 				frame.refs += 1;
 			}
 			this.refs.set(ref, entry);
+			this.refByNode.set(nodeRefKey(entry.targetId, entry.frameId, entry.generation, entry.backendNodeId), ref);
 		}
 	}
 
@@ -408,6 +438,10 @@ export class RefGenerationLifecycle {
 			this.frames.delete(frame.frameId);
 		}
 	}
+}
+
+function nodeRefKey(targetId: string, frameId: string, generation: number, backendNodeId: number): string {
+	return `${targetId}\u0000${frameId}\u0000${generation}\u0000${backendNodeId}`;
 }
 
 export function staleRefError(ref: string, cause?: unknown): Error {

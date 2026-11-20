@@ -185,6 +185,7 @@ export type BatchReadResult =
 		title?: string;
 		targetId?: string;
 		unchanged?: boolean;
+		diff?: boolean;
 	}
 	| { type: "browser_state"; state: BrowserState }
 	| { type: "browser_wait_for"; result: BrowserWaitForResult }

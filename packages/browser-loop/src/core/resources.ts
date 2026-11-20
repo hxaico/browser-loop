@@ -193,6 +193,7 @@ function formatReadResults(
 					...(read.title !== undefined ? { title: read.title } : {}),
 					...(read.targetId !== undefined ? { targetId: read.targetId } : {}),
 					...(read.unchanged !== undefined ? { unchanged: read.unchanged } : {}),
+					...(read.diff !== undefined ? { diff: read.diff } : {}),
 				});
 				break;
 			case "browser_state": {

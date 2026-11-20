@@ -113,7 +113,12 @@ describe("browser_act orchestration", () => {
 			},
 			wait: options.wait ?? (async () => waits.shift() ?? waitResult("newly_verified")),
 			evaluate: (expect, state, baseline) => evaluateBrowserExpectation(expect, state, baseline, () => ({ truth: undefined, details: ["ref unavailable"] })),
-			present: (state): BrowserPresentation => ({ observation: state, cacheKey: "", shape: state.title, lines: [{ text: `RootWebArea ${state.title} [\u0000]`, ctx: {} as never }] }),
+			present: (state): BrowserPresentation => ({
+				observation: state,
+				cacheKey: "",
+				shape: state.title,
+				lines: [{ text: `RootWebArea ${state.title} [\u0000]`, ctx: {} as never, depth: 0, role: "RootWebArea", name: state.title, nodeKey: "root" }],
+			}),
 			render: (presentation) => presentation.shape,
 		};
 	}
@@ -462,7 +467,7 @@ describe("browser_act orchestration", () => {
 			observation: state,
 			cacheKey: "",
 			shape: lines.join("\n"),
-			lines: lines.map((text) => ({ text, ctx: {} as never })),
+			lines: lines.map((text, index) => ({ text, ctx: {} as never, depth: 0, role: "node", name: text, nodeKey: `line:${index}` })),
 		});
 		const diff = diffObservations(
 			presentation(beforeObservation, ["button Save [\u0000]", "button Save [\u0000]", "text old"]),
@@ -1253,7 +1258,7 @@ describe("BrowserExecutor snapshot rendering", () => {
 		const { cdp } = createFakeCdp(tree);
 		const executor = new BrowserExecutor(cdp);
 		expect(await snapshotText(executor)).toBe('RootWebArea "Page"\n  button "Save" [e1]');
-		expect(await snapshotText(executor, { depth: 1 })).toBe('RootWebArea "Page"\n  button "Save" [e2]');
+		expect(await snapshotText(executor, { depth: 1 })).toBe('RootWebArea "Page"\n  button "Save" [e1]');
 	});
 
 	it("treats treeitem as interactive and the bogus textarea role as non-interactive", async () => {
@@ -1584,7 +1589,9 @@ describe("BrowserExecutor snapshot diffing", () => {
 		const { cdp } = createFakeCdp(BUTTON_TREE);
 		const executor = new BrowserExecutor(cdp);
 		await snapshotText(executor);
-		expect(await snapshotText(executor, { filter: "interactive" })).toContain('button "Save" [e2]');
+		const filtered = await snapshotText(executor, { filter: "interactive" });
+		expect(filtered).toContain('button "Save" [e1]');
+		expect(filtered).not.toContain("RootWebArea");
 	});
 });
 
@@ -2302,10 +2309,16 @@ describe("BrowserExecutor ref state export/import", () => {
 		await snapshotText(first);
 		const state = first.exportRefState();
 
-		const { cdp, emit } = createFakeCdp(BUTTON_TREE);
+		const { cdp, emit } = createFakeCdp([
+			ax({ nodeId: "1", role: "RootWebArea", name: "Page", childIds: ["2", "3"] }),
+			ax({ nodeId: "2", role: "button", name: "Save", backendDOMNodeId: 42, parentId: "1" }),
+			ax({ nodeId: "3", role: "button", name: "Cancel", backendDOMNodeId: 43, parentId: "1" }),
+		]);
 		const second = new BrowserExecutor(cdp);
 		second.importRefState(state);
-		expect(await snapshotText(second)).toContain('button "Save" [e2]');
+		const snap = await snapshotText(second);
+		expect(snap).toContain('button "Save" [e1]');
+		expect(snap).toContain('button "Cancel" [e2]');
 
 		emit({ method: "Page.frameNavigated", params: { frame: { id: "F0" } }, sessionId: "session-1" });
 		await expect(second.execute({ type: "browser_click", ref: "e1" } as BrowserAction)).rejects.toThrow(/stale/);
