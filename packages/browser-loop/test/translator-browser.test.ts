@@ -605,6 +605,7 @@ function createFakeCdp(initialNodes: unknown[] = []) {
 	let autoNavigationLifecycle = true;
 	let historyNavigationMode: "load" | "bfcache" = "load";
 	let navigationSequence = 0;
+	let isolatedWorldSequence = 0;
 	const navigationHistory = { currentIndex: 1, entries: [{ id: 1, url: "https://before.test" }, { id: 2, url: "https://a.test" }, { id: 3, url: "https://after.test" }] };
 	const sessionTrees = new Map<string, Array<{ backendDOMNodeId?: number }>>();
 	const frameTrees = new Map<string, Array<{ backendDOMNodeId?: number }>>();
@@ -705,6 +706,8 @@ function createFakeCdp(initialNodes: unknown[] = []) {
 				case "DOM.resolveNode":
 					requireBackendId(params.backendNodeId, sessionId);
 					return { object: { objectId: "node-obj" } };
+				case "Page.createIsolatedWorld":
+					return { executionContextId: ++isolatedWorldSequence };
 				case "Runtime.evaluate":
 					if (params.returnByValue === false) return { result: { objectId: "cursor-scan" } };
 					return { result: { value: runtimeValue } };

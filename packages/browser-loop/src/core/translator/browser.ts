@@ -25,6 +25,7 @@ import {
 	oopifFrameOffset,
 	type FrameTreeNode,
 } from "./browser-document-reconciliation";
+import { BrowserIsolatedWorldRegistry, isStaleContextError } from "./browser-isolated-world";
 import { FrameCollectionError, frameCollectionError, isExpectedFrameCollectionError } from "./browser-frame-collection";
 import {
 	FRAME_ROLES,
@@ -94,6 +95,30 @@ export interface BrowserFindCandidate {
 	score: number;
 }
 
+export interface BrowserEvaluateOptions {
+	tabId?: string;
+	isolated?: boolean;
+	awaitPromise?: boolean;
+	timeoutMs?: number;
+	signal?: AbortSignal;
+}
+
+export interface BrowserScreenshotOptions {
+	format?: "png" | "jpeg";
+	quality?: number;
+}
+
+/** Raised when JavaScript evaluated in a page throws an uncaught exception. */
+export class BrowserEvaluateError extends Error {
+	constructor(
+		message: string,
+		readonly description?: string,
+	) {
+		super(message);
+		this.name = "BrowserEvaluateError";
+	}
+}
+
 /**
  * Executes browser-plane canonical actions over CDP.
  *
@@ -150,10 +175,12 @@ export class BrowserExecutor {
 	private readonly refs = new Map<string, RefEntry>();
 	private readonly lifecycle = new RefGenerationLifecycle(this.refs);
 	private readonly targetsBySession = new Map<string, string>();
+	private readonly pendingSessionInits = new Map<string, Promise<void>>();
 	private readonly frameSessions = new Map<string, string>();
 	private readonly frameOwners = new Map<string, string>();
 	private readonly frameTargets = new Set<string>();
 	private readonly documents: BrowserDocumentReconciler;
+	private readonly isolatedWorlds: BrowserIsolatedWorldRegistry;
 	private readonly lastSnapshots = new Map<string, { key: string; shape: string }>();
 	private readonly mainFramesByTarget = new Map<string, string>();
 	private readonly navigationEpochs = new Map<string, number>();
@@ -161,13 +188,22 @@ export class BrowserExecutor {
 	private readonly pendingNavigations = new Map<string, PendingNavigation>();
 	private readonly dialogNotes: string[] = [];
 	private refCounter = 0;
+	private cursorScanSeq = 0;
 	private activeTargetId?: string;
 	private readonly cdp: CdpConnection;
 
 	constructor(cdp: string | CdpConnection) {
 		this.cdp = typeof cdp === "string" ? new CdpConnection(cdp) : cdp;
 		this.documents = new BrowserDocumentReconciler(this.cdp, this.lifecycle, this.frameSessions);
+		this.isolatedWorlds = new BrowserIsolatedWorldRegistry(this.cdp);
 		this.cdp.onEvent((event) => this.handleCdpEvent(event));
+		this.cdp.onClose?.(() => {
+			this.targetsBySession.clear();
+			this.pendingSessionInits.clear();
+			this.frameSessions.clear();
+			this.isolatedWorlds.clear();
+			for (const entry of this.refs.values()) entry.sessionId = "";
+		});
 	}
 
 	private handleCdpEvent(event: CdpEventMessage): void {
@@ -179,10 +215,12 @@ export class BrowserExecutor {
 				const sessionTargetId = this.targetsBySession.get(event.sessionId);
 				if (!sessionTargetId) return;
 				if (this.frameTargets.has(sessionTargetId)) {
+					this.isolatedWorlds.evictSession(event.sessionId);
 					// The OOPIF tree and any same-process descendants fetched through
 					// its session share the OOPIF generation key.
 					const owner = this.ownerForFrameTarget(sessionTargetId);
 					if (owner) {
+						this.isolatedWorlds.evictFrame(owner, sessionTargetId);
 						this.lifecycle.invalidateFrame(owner, sessionTargetId);
 						if (frame.loaderId) this.lifecycle.recordDocument(sessionTargetId, owner, frame.loaderId);
 					}
@@ -190,11 +228,13 @@ export class BrowserExecutor {
 				}
 				if (frame.parentId) {
 					if (frame.id) {
+						this.isolatedWorlds.evictFrame(sessionTargetId, frame.id);
 						this.lifecycle.invalidateFrame(sessionTargetId, frame.id);
 						if (frame.loaderId) this.lifecycle.recordDocument(frame.id, sessionTargetId, frame.loaderId);
 					}
 					return;
 				}
+				this.isolatedWorlds.evictTarget(sessionTargetId);
 				if (frame.id) this.mainFramesByTarget.set(sessionTargetId, frame.id);
 				if (!this.selfNavigations.delete(sessionTargetId)) this.lifecycle.invalidateTarget(sessionTargetId);
 				// Record the committed document so it reflects the current generation,
@@ -208,9 +248,14 @@ export class BrowserExecutor {
 				const sessionTargetId = this.targetsBySession.get(event.sessionId);
 				if (!frameId || !sessionTargetId) return;
 				if (this.frameTargets.has(sessionTargetId)) {
+					this.isolatedWorlds.evictSession(event.sessionId);
 					const owner = this.ownerForFrameTarget(sessionTargetId);
-					if (owner) this.lifecycle.invalidateFrame(owner, sessionTargetId);
+					if (owner) {
+						this.isolatedWorlds.evictFrame(owner, sessionTargetId);
+						this.lifecycle.invalidateFrame(owner, sessionTargetId);
+					}
 				} else {
+					this.isolatedWorlds.evictFrame(sessionTargetId, frameId);
 					this.lifecycle.removeFrame(sessionTargetId, frameId);
 				}
 				return;
@@ -260,6 +305,8 @@ export class BrowserExecutor {
 				if (typeof sessionId !== "string") return;
 				const targetId = this.targetsBySession.get(sessionId);
 				this.targetsBySession.delete(sessionId);
+				this.pendingSessionInits.delete(sessionId);
+				this.isolatedWorlds.evictSession(sessionId);
 				if (!targetId) return;
 				if (this.frameTargets.has(targetId)) {
 					const owner = this.ownerForFrameTarget(targetId);
@@ -397,13 +444,13 @@ export class BrowserExecutor {
 	private async dispatch(action: BrowserAction, signal?: AbortSignal): Promise<BatchReadResult[]> {
 		switch (action.type) {
 			case "browser_snapshot":
-				return [{ type: "browser_text", label: "snapshot", text: await this.snapshot(action) }];
+				return [{ type: "browser_text", label: "snapshot", ...(await this.snapshot(action)) }];
 			case "browser_act":
 				return [{ type: "browser_act", result: await this.act(action) }];
 			case "browser_wait_for":
 				return [{ type: "browser_wait_for", result: await this.waitFor(action) }];
 			case "browser_text":
-				return [{ type: "browser_text", label: "text", text: await this.pageText(tabOf(action)) }];
+				return [{ type: "browser_text", label: "text", text: await this.pageText(tabOf(action), signal) }];
 			case "browser_find":
 				return [{ type: "browser_text", label: "find", text: await this.find(action) }];
 			case "browser_click":
@@ -452,14 +499,42 @@ export class BrowserExecutor {
 			case "browser_close_tab":
 				return [{ type: "browser_state", state: await this.closeTab(action.tab_id) }];
 			case "browser_screenshot":
-				return [{ type: "screenshot", ...(await this.screenshot(action.region, action.tab_id)) }];
+				return [{
+					type: "screenshot",
+					...(await this.screenshot(
+						action.region,
+						action.tab_id,
+						action.format !== undefined || action.quality !== undefined
+							? { format: action.format, quality: action.quality }
+							: undefined,
+					)),
+				}];
 			case "browser_evaluate":
-				return [{ type: "browser_text", label: "evaluate", text: await this.evaluate(action.code, tabOf(action)) }];
+				return [{
+					type: "browser_text",
+					label: "evaluate",
+					text: await this.evaluate(action.code, {
+						tabId: tabOf(action),
+						isolated: action.isolated,
+						awaitPromise: action.await_promise,
+						timeoutMs: action.timeout_ms,
+						signal,
+					}),
+				}];
 		}
 	}
 
-	async screenshot(region?: [number, number, number, number], tabId?: string): Promise<{ data: Buffer; mimeType: string }> {
+	async screenshot(
+		region?: [number, number, number, number],
+		tabId?: string,
+		options?: BrowserScreenshotOptions,
+	): Promise<{ data: Buffer; mimeType: string }> {
 		const session = await this.session(tabId);
+		const format = options?.format === "jpeg" ? "jpeg" : "png";
+		const quality =
+			format === "jpeg"
+				? Math.round(clamp(options?.quality !== undefined && Number.isFinite(options.quality) ? options.quality : 85, 1, 100))
+				: undefined;
 		const clip = region
 			? {
 					clip: {
@@ -471,14 +546,30 @@ export class BrowserExecutor {
 					},
 				}
 			: {};
-		const { data } = await this.cdp.send<{ data: string }>("Page.captureScreenshot", { format: "png", ...clip }, session);
-		return { data: Buffer.from(data, "base64"), mimeType: "image/png" };
+		const { data } = await this.cdp.send<{ data: string }>(
+			"Page.captureScreenshot",
+			{ format, ...(quality !== undefined ? { quality } : {}), ...clip },
+			session,
+		);
+		return {
+			data: Buffer.from(data, "base64"),
+			mimeType: format === "jpeg" ? "image/jpeg" : "image/png",
+		};
 	}
 
-	private async snapshot(action: BrowserActionSnapshot): Promise<string> {
-		return this.withObservation(action.tab_id, true, (observation) =>
-			this.renderObservation(this.presentObservation(observation, action)),
-		);
+	private async snapshot(
+		action: BrowserActionSnapshot,
+	): Promise<{ text: string; url: string; title: string; targetId: string; unchanged: boolean }> {
+		return this.withObservation(action.tab_id, action.include_cursor ?? true, (observation) => {
+			const rendered = this.renderObservationResult(this.presentObservation(observation, action));
+			return {
+				text: rendered.text,
+				url: observation.url,
+				title: observation.title,
+				targetId: observation.targetId,
+				unchanged: rendered.unchanged,
+			};
+		});
 	}
 
 	private observe(tabId?: string, includeCursor = false): Promise<BrowserObservation> {
@@ -616,7 +707,7 @@ export class BrowserExecutor {
 				sessionId,
 				generation: rootCapture.generation,
 				nthIndex: buildNthIndex(nodes),
-				...(includeCursor ? { cursorIds: await this.cursorPointerIds(pageSession) } : {}),
+				...(includeCursor ? { cursorIds: await this.cursorPointerIds(targetId, pageSession, pageTree?.frame) } : {}),
 			};
 			const tree = this.frameStitch(nodes, rootCtx);
 			const { stitches, incompleteFrames } = await this.stitchFrames(nodes, targetId, pageSession, captures, pageTree);
@@ -704,19 +795,36 @@ export class BrowserExecutor {
 		for (const rootId of rootIds) walk(tree, rootId, 0, "");
 		const shape = lines.map((line) => line.text).join("\n");
 		const generationKey = [...observation.generations].map(([frameKey, generation]) => `${frameKey}:${generation}`).join("|");
+		const includeCursor = observation.tree.ctx.cursorIds !== undefined;
 		return {
 			observation,
-			cacheKey: [action.ref ?? "", action.depth ?? "", action.filter ?? "", `revision:${observation.revision}`, generationKey].join("|"),
+			cacheKey: [
+				action.ref ?? "",
+				action.depth ?? "",
+				action.filter ?? "",
+				`cursor:${includeCursor ? 1 : 0}`,
+				`revision:${observation.revision}`,
+				generationKey,
+			].join("|"),
 			lines,
 			shape,
 		};
 	}
 
 	private renderObservation(presentation: BrowserPresentation, comparePrevious = true): string {
+		return this.renderObservationResult(presentation, comparePrevious).text;
+	}
+
+	private renderObservationResult(
+		presentation: BrowserPresentation,
+		comparePrevious = true,
+	): { text: string; unchanged: boolean } {
 		const { observation, cacheKey, lines, shape } = presentation;
 		const cached = this.lastSnapshots.get(observation.targetId);
 		this.lastSnapshots.set(observation.targetId, { key: cacheKey, shape });
-		if (comparePrevious && cached?.key === cacheKey && cached.shape === shape) return UNCHANGED_SNAPSHOT;
+		if (comparePrevious && cached?.key === cacheKey && cached.shape === shape) {
+			return { text: UNCHANGED_SNAPSHOT, unchanged: true };
+		}
 		let text = "";
 		for (const line of lines) {
 			if (text.length > SNAPSHOT_CHAR_LIMIT) break;
@@ -727,7 +835,7 @@ export class BrowserExecutor {
 			text = `${text.slice(0, SNAPSHOT_CHAR_LIMIT)}\n… truncated at ${SNAPSHOT_CHAR_LIMIT} characters. Re-request with a smaller depth, filter: "interactive", or a ref to narrow the subtree.`;
 		}
 		this.pruneRefs(observation.targetId);
-		return text || "(empty accessibility tree)";
+		return { text: text || "(empty accessibility tree)", unchanged: false };
 	}
 
 	/** Fetch a frame's AX tree: OOPIFs through their own session, same-process frames through the page session with a frameId. */
@@ -825,31 +933,53 @@ export class BrowserExecutor {
 	}
 
 	/** Resolve backend node ids for elements whose own computed cursor is "pointer", without touching the DOM. */
-	private async cursorPointerIds(session: string): Promise<ReadonlySet<number>> {
+	private async cursorPointerIds(
+		targetId: string,
+		session: string,
+		frame?: { id?: string; loaderId?: string },
+	): Promise<ReadonlySet<number>> {
 		const ids = new Set<number>();
-		const { result } = await this.cdp.send<{ result: { objectId?: string } }>(
-			"Runtime.evaluate",
-			{ expression: CURSOR_POINTER_SCAN, returnByValue: false, objectGroup: CURSOR_SCAN_GROUP },
-			session,
-		);
-		if (!result.objectId) return ids;
+		const frameId = frame?.id ?? this.mainFramesByTarget.get(targetId) ?? await this.mainFrameId(targetId, session);
+		const objectGroup = `loop-cursor-scan-${++this.cursorScanSeq}`;
+		let objectId: string | undefined;
 		try {
+			const { result } = await this.isolatedWorlds.evaluate({
+				targetId,
+				sessionId: session,
+				frameId,
+				loaderId: frame?.loaderId,
+				expression: CURSOR_POINTER_SCAN,
+				wrap: false,
+				returnByValue: false,
+				awaitPromise: false,
+				objectGroup,
+			});
+			objectId = (result as { objectId?: string }).objectId;
+			if (!objectId) return ids;
 			const { result: properties } = await this.cdp.send<{ result: Array<{ name: string; value?: { objectId?: string } }> }>(
 				"Runtime.getProperties",
-				{ objectId: result.objectId, ownProperties: true },
+				{ objectId, ownProperties: true },
 				session,
 			);
 			const objectIds = properties
 				.filter((property) => /^\d+$/.test(property.name) && property.value?.objectId)
 				.map((property) => property.value!.objectId!);
 			const described = await Promise.all(
-				objectIds.map((objectId) => this.cdp.send<{ node: { backendNodeId?: number } }>("DOM.describeNode", { objectId }, session)),
+				objectIds.map((id) => this.cdp.send<{ node: { backendNodeId?: number } }>("DOM.describeNode", { objectId: id }, session)),
 			);
 			for (const { node } of described) {
 				if (node.backendNodeId !== undefined) ids.add(node.backendNodeId);
 			}
+		} catch (error) {
+			if (isStaleContextError(error)) {
+				this.isolatedWorlds.evictFrame(targetId, frameId);
+				throw new ObservationChangedError("Execution context changed during cursor scan");
+			}
+			throw error;
 		} finally {
-			await this.cdp.send("Runtime.releaseObjectGroup", { objectGroup: CURSOR_SCAN_GROUP }, session).catch(() => {});
+			if (objectId) {
+				await this.cdp.send("Runtime.releaseObjectGroup", { objectGroup }, session).catch(() => {});
+			}
 		}
 		return ids;
 	}
@@ -1208,19 +1338,64 @@ export class BrowserExecutor {
 		};
 	}
 
-	private async evaluate(code: string, tabId?: string): Promise<string> {
-		const session = await this.session(tabId);
-		const { result, exceptionDetails } = await this.cdp.send<{
-			result: { value?: unknown; description?: string; type?: string };
-			exceptionDetails?: { exception?: { description?: string } };
-		}>("Runtime.evaluate", { expression: code, returnByValue: true, awaitPromise: true }, session);
-		if (exceptionDetails) throw new Error(`browser_evaluate failed: ${exceptionDetails.exception?.description ?? "evaluation threw"}`);
+	/** Evaluate JavaScript in the page (or its cached isolated world) and return the serialized value. */
+	async evaluateValue<T = unknown>(code: string, options: BrowserEvaluateOptions = {}): Promise<T> {
+		const { value } = await this.evaluateRemote(code, options);
+		return value as T;
+	}
+
+	private async evaluateRemote(
+		code: string,
+		options: BrowserEvaluateOptions = {},
+	): Promise<{ value?: unknown; description?: string; type?: string }> {
+		const awaitPromise = options.awaitPromise ?? true;
+		const run = async (): Promise<{ value?: unknown; description?: string; type?: string }> => {
+			const targetId = await this.resolveTarget(options.tabId);
+			const session = await this.attach(targetId);
+			let evaluated: {
+				result: { value?: unknown; description?: string; type?: string };
+				exceptionDetails?: { text?: string; exception?: { description?: string } };
+			};
+			if (options.isolated) {
+				const { frameTree } = await this.cdp.send<{ frameTree?: FrameTreeNode }>("Page.getFrameTree", {}, session);
+				const frameId = frameTree?.frame?.id ?? this.mainFramesByTarget.get(targetId);
+				if (!frameId) throw new Error(`could not resolve the main frame for target ${targetId}`);
+				this.mainFramesByTarget.set(targetId, frameId);
+				evaluated = await this.isolatedWorlds.evaluate({
+					targetId,
+					sessionId: session,
+					frameId,
+					loaderId: frameTree?.frame?.loaderId,
+					expression: code,
+					returnByValue: true,
+					awaitPromise,
+					signal: options.signal,
+				});
+			} else {
+				evaluated = await this.cdp.send("Runtime.evaluate", {
+					expression: code,
+					returnByValue: true,
+					awaitPromise,
+				}, session);
+			}
+			if (evaluated.exceptionDetails) {
+				const description =
+					evaluated.exceptionDetails.exception?.description ?? evaluated.exceptionDetails.text ?? "evaluation threw";
+				throw new BrowserEvaluateError(`browser_evaluate failed: ${description}`, description);
+			}
+			return evaluated.result;
+		};
+		return raceTimeoutAndSignal(run(), options.timeoutMs, options.signal);
+	}
+
+	private async evaluate(code: string, options: BrowserEvaluateOptions = {}): Promise<string> {
+		const result = await this.evaluateRemote(code, options);
 		if (result.value === undefined) return result.description ?? String(result.type ?? "undefined");
 		return typeof result.value === "string" ? result.value : JSON.stringify(result.value);
 	}
 
-	private async pageText(tabId?: string): Promise<string> {
-		return this.evaluate("document.body ? document.body.innerText : ''", tabId);
+	private async pageText(tabId?: string, signal?: AbortSignal): Promise<string> {
+		return this.evaluate("document.body ? document.body.innerText : ''", { tabId, signal });
 	}
 
 	private async tabContext(executedOn: string): Promise<string> {
@@ -1373,6 +1548,7 @@ export class BrowserExecutor {
 		const navigation = this.pendingNavigations.get(targetId);
 		if (navigation) this.cancelNavigation(navigation);
 		this.lifecycle.dropTarget(targetId);
+		this.isolatedWorlds.evictTarget(targetId);
 		this.mainFramesByTarget.delete(targetId);
 		this.navigationEpochs.delete(targetId);
 		this.selfNavigations.delete(targetId);
@@ -1380,7 +1556,11 @@ export class BrowserExecutor {
 		for (const [frameId, owner] of this.frameOwners) {
 			if (owner !== targetId) continue;
 			const sessionId = this.frameSessions.get(frameId);
-			if (sessionId) this.targetsBySession.delete(sessionId);
+			if (sessionId) {
+				this.targetsBySession.delete(sessionId);
+				this.pendingSessionInits.delete(sessionId);
+				this.isolatedWorlds.evictSession(sessionId);
+			}
 			this.frameSessions.delete(frameId);
 			this.frameOwners.delete(frameId);
 			this.frameTargets.delete(frameId);
@@ -1409,14 +1589,35 @@ export class BrowserExecutor {
 
 	private async attach(targetId: string): Promise<string> {
 		const session = await this.cdp.attachToTarget(targetId);
-		if (!this.targetsBySession.has(session)) {
-			this.targetsBySession.set(session, targetId);
-			await this.cdp.send("Page.enable", {}, session);
-			await this.cdp.send("Page.setLifecycleEventsEnabled", { enabled: true }, session);
-			// setAutoAttach must run before reconcile so an imported OOPIF's session
-			// surfaces (via attachedToTarget) in time to read its own document.
-			await this.cdp.send("Target.setAutoAttach", { autoAttach: true, flatten: true, waitForDebuggerOnStart: false }, session);
+		for (const [oldSession, mappedTarget] of this.targetsBySession) {
+			if (mappedTarget === targetId && oldSession !== session) {
+				this.targetsBySession.delete(oldSession);
+				this.pendingSessionInits.delete(oldSession);
+				this.isolatedWorlds.evictSession(oldSession);
+			}
 		}
+		let init = this.pendingSessionInits.get(session);
+		if (!init && !this.targetsBySession.has(session)) {
+			this.targetsBySession.set(session, targetId);
+			init = (async () => {
+				try {
+					await this.cdp.send("Page.enable", {}, session);
+					await this.cdp.send("Page.setLifecycleEventsEnabled", { enabled: true }, session);
+					// setAutoAttach must run before reconcile so an imported OOPIF's session
+					// surfaces (via attachedToTarget) in time to read its own document.
+					await this.cdp.send("Target.setAutoAttach", { autoAttach: true, flatten: true, waitForDebuggerOnStart: false }, session);
+				} catch (err) {
+					if (this.targetsBySession.get(session) === targetId) this.targetsBySession.delete(session);
+					throw err;
+				} finally {
+					if (this.pendingSessionInits.get(session) === init) this.pendingSessionInits.delete(session);
+				}
+			})();
+			this.pendingSessionInits.set(session, init);
+		} else if (!this.targetsBySession.has(session)) {
+			this.targetsBySession.set(session, targetId);
+		}
+		if (init) await init;
 		await this.documents.reconcile(targetId, session);
 		return session;
 	}
@@ -1425,7 +1626,8 @@ export class BrowserExecutor {
 		const targets = await this.cdp.pageTargets();
 		if (targets.length === 0) throw new Error("no open browser tabs");
 		if (tabId) {
-			const match = targets.find((target) => shortTabId(target.targetId) === tabId || target.targetId === tabId);
+			const normalized = tabId.toUpperCase();
+			const match = targets.find((target) => shortTabId(target.targetId) === normalized || target.targetId === tabId);
 			if (!match) throw new Error(`unknown tab_id "${tabId}". Call list_tabs for current tabs.`);
 			return match.targetId;
 		}
@@ -1612,7 +1814,46 @@ const FILL_FUNCTION = `function(value) {
 	el.dispatchEvent(new Event("change", { bubbles: true }));
 }`;
 
-const CURSOR_SCAN_GROUP = "loop-cursor-scan";
+function clamp(value: number, min: number, max: number): number {
+	return Math.max(min, Math.min(max, value));
+}
+
+async function raceTimeoutAndSignal<T>(
+	promise: Promise<T>,
+	timeoutMs: number | undefined,
+	signal: AbortSignal | undefined,
+): Promise<T> {
+	throwIfAborted(signal);
+	if (timeoutMs === undefined && !signal) return promise;
+	promise.catch(() => {});
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const cleanup = () => {
+			if (timer !== undefined) clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		};
+		const settle = (fn: () => void) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			fn();
+		};
+		const onAbort = () => settle(() => reject(signal?.reason instanceof Error ? signal.reason : new Error("browser action aborted")));
+		if (signal) signal.addEventListener("abort", onAbort, { once: true });
+		if (timeoutMs !== undefined) {
+			if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+				settle(() => reject(new Error("timeoutMs must be a non-negative finite number")));
+				return;
+			}
+			timer = setTimeout(() => settle(() => reject(new Error(`browser_evaluate timed out after ${timeoutMs}ms`))), timeoutMs);
+		}
+		promise.then(
+			(value) => settle(() => resolve(value)),
+			(error) => settle(() => reject(error)),
+		);
+	});
+}
 
 const CURSOR_POINTER_SCAN = `(() => {
 	const matches = [];

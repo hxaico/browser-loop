@@ -177,7 +177,15 @@ export type BatchReadResult =
 	| { type: "screenshot"; data: Buffer; mimeType: string }
 	| { type: "url"; url: string }
 	| { type: "cursor_position"; x: number; y: number }
-	| { type: "browser_text"; label: string; text: string }
+	| {
+		type: "browser_text";
+		label: string;
+		text: string;
+		url?: string;
+		title?: string;
+		targetId?: string;
+		unchanged?: boolean;
+	}
 	| { type: "browser_state"; state: BrowserState }
 	| { type: "browser_wait_for"; result: BrowserWaitForResult }
 	| { type: "browser_act"; result: BrowserActResult };
