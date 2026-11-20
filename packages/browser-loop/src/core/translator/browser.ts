@@ -26,6 +26,13 @@ import {
 	type FrameTreeNode,
 } from "./browser-document-reconciliation";
 import { BrowserIsolatedWorldRegistry, isStaleContextError } from "./browser-isolated-world";
+import {
+	areSnapshotNodesIdentical,
+	formatSnapshotDiffResult,
+	hasDroppedStitchedFrame,
+	type SnapshotDiffBaseline,
+	type SnapshotDiffNode,
+} from "./browser-snapshot-diff";
 import { FrameCollectionError, frameCollectionError, isExpectedFrameCollectionError } from "./browser-frame-collection";
 import {
 	FRAME_ROLES,
@@ -56,7 +63,7 @@ import {
 	type RefEntry,
 } from "./browser-ref-lifecycle";
 import { evaluateBrowserExpectation, waitForBrowserExpectation, type BrowserExpectationEvaluation } from "./browser-wait";
-import type { BatchReadResult, BrowserActResult, BrowserState, BrowserWaitForResult } from "./types";
+import type { BatchReadResult, BrowserActResult, BrowserState, BrowserWaitForResult, SnapshotDiffSkipReason } from "./types";
 
 const SNAPSHOT_CHAR_LIMIT = 50_000;
 const DEFAULT_SNAPSHOT_DEPTH = 15;
@@ -86,6 +93,11 @@ interface PendingNavigation {
 interface CollectedObservation {
 	readonly observation: BrowserObservation;
 	readonly captures: readonly GenerationCapture[];
+}
+
+interface SnapshotBaseline extends SnapshotDiffBaseline {
+	readonly cacheKey: string;
+	readonly shape: string;
 }
 
 export interface BrowserFindCandidate {
@@ -181,7 +193,7 @@ export class BrowserExecutor {
 	private readonly frameTargets = new Set<string>();
 	private readonly documents: BrowserDocumentReconciler;
 	private readonly isolatedWorlds: BrowserIsolatedWorldRegistry;
-	private readonly lastSnapshots = new Map<string, { key: string; shape: string }>();
+	private readonly lastSnapshots = new Map<string, SnapshotBaseline>();
 	private readonly mainFramesByTarget = new Map<string, string>();
 	private readonly navigationEpochs = new Map<string, number>();
 	private readonly selfNavigations = new Set<string>();
@@ -559,15 +571,31 @@ export class BrowserExecutor {
 
 	private async snapshot(
 		action: BrowserActionSnapshot,
-	): Promise<{ text: string; url: string; title: string; targetId: string; unchanged: boolean }> {
+	): Promise<{
+		text: string;
+		url: string;
+		title: string;
+		targetId: string;
+		unchanged: boolean;
+		diff: boolean;
+		diffSkipReason?: SnapshotDiffSkipReason;
+	}> {
 		return this.withObservation(action.tab_id, action.include_cursor ?? true, (observation) => {
-			const rendered = this.renderObservationResult(this.presentObservation(observation, action));
+			const comparePrevious = !action.force_full;
+			const diff = Boolean(action.diff && !action.force_full);
+			const rendered = this.renderObservationResult(this.presentObservation(observation, action), {
+				comparePrevious,
+				diff,
+				maxDiffChangeRatio: action.max_diff_change_ratio,
+			});
 			return {
 				text: rendered.text,
 				url: observation.url,
 				title: observation.title,
 				targetId: observation.targetId,
 				unchanged: rendered.unchanged,
+				diff: rendered.diff,
+				...(rendered.diffSkipReason ? { diffSkipReason: rendered.diffSkipReason } : {}),
 			};
 		});
 	}
@@ -762,23 +790,67 @@ export class BrowserExecutor {
 		}
 		const interactiveOnly = action.filter === "interactive";
 		const lines: ObservationLine[] = [];
+		const seenNodeKeys = new Map<string, number>();
+		const seenTextSiblings = new Map<string, number>();
+		const allocateNodeKey = (
+			node: AXNode,
+			ctx: RenderContext,
+			role: string,
+			name: string,
+			parentNodeKey: string,
+		): string => {
+			if (node.backendDOMNodeId !== undefined) {
+				const base = `${ctx.frameKey}:${ctx.generation}:b:${node.backendDOMNodeId}`;
+				const occ = seenNodeKeys.get(base) ?? 0;
+				seenNodeKeys.set(base, occ + 1);
+				return occ === 0 ? base : `${base}:d${occ}`;
+			}
+			const base = `${parentNodeKey}/t:${role}:${name}`;
+			const siblingOrdinal = seenTextSiblings.get(base) ?? 0;
+			seenTextSiblings.set(base, siblingOrdinal + 1);
+			return `${base}#${siblingOrdinal}`;
+		};
 		const maxDepth = action.depth ?? DEFAULT_SNAPSHOT_DEPTH;
-		const walk = (current: FrameStitch, nodeId: string, depth: number, parentName: string): void => {
+		const walk = (
+			current: FrameStitch,
+			nodeId: string,
+			depth: number,
+			parentName: string,
+			parentLineIndex: number | undefined,
+			parentNodeKey: string,
+		): void => {
 			const node = current.byId.get(nodeId);
 			if (!node) return;
 			const ctx = current.ctx;
 			let childDepth = depth;
+			let childParentLineIndex = parentLineIndex;
+			let childParentNodeKey = parentNodeKey;
 			if (!node.ignored) {
 				const rendered = renderObservationNode(node, depth, parentName, ctx, interactiveOnly);
 				if (rendered) {
-					lines.push({ ...rendered, ctx });
+					const nodeKey = allocateNodeKey(node, ctx, rendered.role, rendered.name, parentNodeKey);
+					const lineIndex = lines.length;
+					lines.push({
+						text: rendered.text,
+						refNode: rendered.refNode,
+						ctx,
+						depth,
+						role: rendered.role,
+						name: rendered.name,
+						parentLineIndex,
+						nodeKey,
+					});
 					childDepth = depth + 1;
+					childParentLineIndex = lineIndex;
+					childParentNodeKey = nodeKey;
 				}
 			}
 			if (childDepth > maxDepth) return;
 			const stitch = current === observation.tree && node.backendDOMNodeId !== undefined ? observation.stitches.get(node.backendDOMNodeId) : undefined;
 			if (stitch) {
-				for (const frameRootId of stitch.roots) walk(stitch, frameRootId, childDepth, "");
+				for (const frameRootId of stitch.roots) {
+					walk(stitch, frameRootId, childDepth, "", childParentLineIndex, childParentNodeKey);
+				}
 				return;
 			}
 			const childName = node.name?.value || parentName;
@@ -787,55 +859,150 @@ export class BrowserExecutor {
 				const run = staticTextRun(current.byId, childIds, i);
 				if (run) {
 					const rendered = renderObservationNode(run.node, childDepth, childName, ctx, interactiveOnly);
-					if (rendered) lines.push({ ...rendered, ctx });
+					if (rendered) {
+						const nodeKey = allocateNodeKey(run.node, ctx, rendered.role, rendered.name, childParentNodeKey);
+						lines.push({
+							text: rendered.text,
+							refNode: rendered.refNode,
+							ctx,
+							depth: childDepth,
+							role: rendered.role,
+							name: rendered.name,
+							parentLineIndex: childParentLineIndex,
+							nodeKey,
+						});
+					}
 					i = run.end;
-				} else walk(current, childIds[i]!, childDepth, childName);
+				} else {
+					walk(current, childIds[i]!, childDepth, childName, childParentLineIndex, childParentNodeKey);
+				}
 			}
 		};
-		for (const rootId of rootIds) walk(tree, rootId, 0, "");
+		for (const rootId of rootIds) walk(tree, rootId, 0, "", undefined, "root");
 		const shape = lines.map((line) => line.text).join("\n");
 		const generationKey = [...observation.generations].map(([frameKey, generation]) => `${frameKey}:${generation}`).join("|");
 		const includeCursor = observation.tree.ctx.cursorIds !== undefined;
+		const projectionKey = [
+			action.ref ?? "",
+			action.depth ?? "",
+			action.filter ?? "",
+			`cursor:${includeCursor ? 1 : 0}`,
+		].join("|");
 		return {
 			observation,
-			cacheKey: [
-				action.ref ?? "",
-				action.depth ?? "",
-				action.filter ?? "",
-				`cursor:${includeCursor ? 1 : 0}`,
-				`revision:${observation.revision}`,
-				generationKey,
-			].join("|"),
+			projectionKey,
+			cacheKey: [projectionKey, `revision:${observation.revision}`, generationKey].join("|"),
 			lines,
 			shape,
 		};
 	}
 
 	private renderObservation(presentation: BrowserPresentation, comparePrevious = true): string {
-		return this.renderObservationResult(presentation, comparePrevious).text;
+		return this.renderObservationResult(presentation, { comparePrevious, diff: false }).text;
 	}
 
 	private renderObservationResult(
 		presentation: BrowserPresentation,
-		comparePrevious = true,
-	): { text: string; unchanged: boolean } {
+		options: { comparePrevious?: boolean; diff?: boolean; maxDiffChangeRatio?: number } = {},
+	): { text: string; unchanged: boolean; diff: boolean; diffSkipReason?: SnapshotDiffSkipReason } {
+		const comparePrevious = options.comparePrevious ?? true;
 		const { observation, cacheKey, lines, shape } = presentation;
+		const projectionKey = presentation.projectionKey ?? cacheKey;
 		const cached = this.lastSnapshots.get(observation.targetId);
-		this.lastSnapshots.set(observation.targetId, { key: cacheKey, shape });
-		if (comparePrevious && cached?.key === cacheKey && cached.shape === shape) {
-			return { text: UNCHANGED_SNAPSHOT, unchanged: true };
+		if (comparePrevious && cached?.cacheKey === cacheKey && cached.shape === shape) {
+			return { text: UNCHANGED_SNAPSHOT, unchanged: true, diff: false };
 		}
-		let text = "";
+
+		let fullText = "";
+		let wasTruncated = false;
+		const usedRefsInSnapshot = new Set<string>();
+		const currentNodes: SnapshotDiffNode[] = [];
 		for (const line of lines) {
-			if (text.length > SNAPSHOT_CHAR_LIMIT) break;
-			const rendered = line.refNode ? line.text.replace(REF_PLACEHOLDER, this.mintRef(line.refNode, line.ctx)) : line.text;
-			text = text ? `${text}\n${rendered}` : rendered;
+			if (fullText.length > SNAPSHOT_CHAR_LIMIT) {
+				wasTruncated = true;
+				break;
+			}
+			const mintedRef = line.refNode ? this.mintOrReuseRef(line.refNode, line.ctx, usedRefsInSnapshot) : undefined;
+			const rendered = mintedRef !== undefined ? line.text.replace(REF_PLACEHOLDER, mintedRef) : line.text;
+			fullText = fullText ? `${fullText}\n${rendered}` : rendered;
+			currentNodes.push({
+				line: rendered,
+				depth: line.depth,
+				role: line.role,
+				name: line.name,
+				parentLineIndex: line.parentLineIndex,
+				nodeKey: line.nodeKey,
+				...(mintedRef !== undefined ? { ref: mintedRef } : {}),
+			});
 		}
-		if (text.length > SNAPSHOT_CHAR_LIMIT) {
-			text = `${text.slice(0, SNAPSHOT_CHAR_LIMIT)}\n… truncated at ${SNAPSHOT_CHAR_LIMIT} characters. Re-request with a smaller depth, filter: "interactive", or a ref to narrow the subtree.`;
+		if (fullText.length > SNAPSHOT_CHAR_LIMIT) {
+			wasTruncated = true;
+			fullText = `${fullText.slice(0, SNAPSHOT_CHAR_LIMIT)}\n… truncated at ${SNAPSHOT_CHAR_LIMIT} characters. Re-request with a smaller depth, filter: "interactive", or a ref to narrow the subtree.`;
 		}
-		this.pruneRefs(observation.targetId);
-		return { text: text || "(empty accessibility tree)", unchanged: false };
+		if (!fullText) fullText = "(empty accessibility tree)";
+
+		this.pruneObservationRefs(observation);
+
+		const mainGeneration = observation.generations.get(observation.targetId) ?? 0;
+		const stitchedFrameBackendIds = new Set(observation.stitches.keys());
+		const incompleteFrameBackendIds = new Set(observation.incompleteFrames.map((frame) => frame.backendNodeId));
+		const nextBaseline: SnapshotBaseline = {
+			cacheKey,
+			shape,
+			projectionKey,
+			url: observation.url,
+			mainGeneration,
+			wasTruncated,
+			stitchedFrameBackendIds,
+			nodes: currentNodes,
+		};
+
+		const canCollapseUnchanged =
+			comparePrevious &&
+			cached !== undefined &&
+			cached.projectionKey === projectionKey &&
+			cached.url === observation.url &&
+			cached.mainGeneration === mainGeneration &&
+			!wasTruncated &&
+			!cached.wasTruncated &&
+			!hasDroppedStitchedFrame(cached.stitchedFrameBackendIds, incompleteFrameBackendIds) &&
+			areSnapshotNodesIdentical(cached.nodes, currentNodes);
+		if (canCollapseUnchanged) {
+			this.lastSnapshots.set(observation.targetId, nextBaseline);
+			return { text: UNCHANGED_SNAPSHOT, unchanged: true, diff: false };
+		}
+
+		const diffOutcome =
+			options.diff && cached
+				? formatSnapshotDiffResult({
+						baseline: cached,
+						currentNodes,
+						fullText,
+						projectionKey,
+						url: observation.url,
+						mainGeneration,
+						wasTruncated,
+						incompleteFrameBackendIds,
+						maxDiffChangeRatio: options.maxDiffChangeRatio,
+					})
+				: undefined;
+		const diffSkipReason: SnapshotDiffSkipReason | undefined = options.diff
+			? cached
+				? diffOutcome?.skipReason
+				: "no_baseline"
+			: undefined;
+
+		this.lastSnapshots.set(observation.targetId, nextBaseline);
+
+		if (diffOutcome?.diffText !== undefined) {
+			return { text: diffOutcome.diffText, unchanged: false, diff: true };
+		}
+		return {
+			text: fullText,
+			unchanged: false,
+			diff: false,
+			...(diffSkipReason ? { diffSkipReason } : {}),
+		};
 	}
 
 	/** Fetch a frame's AX tree: OOPIFs through their own session, same-process frames through the page session with a frameId. */
@@ -1014,8 +1181,9 @@ export class BrowserExecutor {
 				.filter((entry) => entry.score > 0 && (!roles || roles.has(entry.node.role?.value ?? "")))
 				.sort((a, b) => b.score - a.score)
 				.slice(0, FIND_MATCH_LIMIT);
+			const usedInPass = new Set<string>();
 			const candidates = scored.map(({ node, ctx, score }) => ({
-				ref: this.mintRef(node, ctx),
+				ref: this.mintOrReuseRef(node, ctx, usedInPass),
 				role: node.role?.value ?? "",
 				name: node.name?.value ?? "",
 				score,
@@ -1492,26 +1660,39 @@ export class BrowserExecutor {
 				? candidates[entry.nth]
 				: undefined;
 		if (!match) throw staleRefError(ref, cause);
-		entry.backendNodeId = match.backendDOMNodeId!;
+		this.lifecycle.rebindBackendNodeId(ref, match.backendDOMNodeId!);
 		return match;
 	}
 
-	private mintRef(node: AXNode, ctx: RenderContext): string {
+	private mintOrReuseRef(node: AXNode, ctx: RenderContext, usedInPass?: Set<string>): string {
+		const backendNodeId = node.backendDOMNodeId!;
 		const role = node.role?.value ?? "";
 		const name = node.name?.value ?? "";
+		const nth = ctx.nthIndex.index.get(node.nodeId) ?? 0;
+		const cohort = ctx.nthIndex.cohorts.get(cohortKey(role, name)) ?? 1;
+		const existing = this.lifecycle.findRef(ctx.targetId, ctx.frameKey, ctx.generation, backendNodeId);
+		if (existing && !usedInPass?.has(existing)) {
+			const entry = this.refs.get(existing);
+			if (entry && entry.targetId === ctx.targetId && this.lifecycle.isRefCurrent(entry)) {
+				this.lifecycle.touchRef(existing, { sessionId: ctx.sessionId, role, name, nth, cohort });
+				usedInPass?.add(existing);
+				return existing;
+			}
+		}
 		this.refCounter += 1;
 		const ref = `e${this.refCounter}`;
 		this.lifecycle.retainRef(ref, {
-			backendNodeId: node.backendDOMNodeId!,
+			backendNodeId,
 			targetId: ctx.targetId,
 			frameId: ctx.frameKey,
 			sessionId: ctx.sessionId,
 			generation: ctx.generation,
 			role,
 			name,
-			nth: ctx.nthIndex.index.get(node.nodeId) ?? 0,
-			cohort: ctx.nthIndex.cohorts.get(cohortKey(role, name)) ?? 1,
+			nth,
+			cohort,
 		});
+		usedInPass?.add(ref);
 		return ref;
 	}
 
@@ -1568,6 +1749,34 @@ export class BrowserExecutor {
 			this.frameOwners.delete(frameId);
 			this.frameTargets.delete(frameId);
 		}
+	}
+
+	private pruneObservationRefs(observation: BrowserObservation): void {
+		const liveBackendIdsByFrame = new Map<string, Set<number>>();
+		liveBackendIdsByFrame.set(observation.targetId, new Set<number>());
+		for (const stitch of observation.stitches.values()) {
+			liveBackendIdsByFrame.set(stitch.ctx.frameKey, new Set<number>());
+		}
+		for (const { node, ctx } of observedNodes(observation)) {
+			if (node.ignored || node.backendDOMNodeId === undefined) continue;
+			let liveSet = liveBackendIdsByFrame.get(ctx.frameKey);
+			if (!liveSet) {
+				liveSet = new Set<number>();
+				liveBackendIdsByFrame.set(ctx.frameKey, liveSet);
+			}
+			liveSet.add(node.backendDOMNodeId);
+		}
+		const pruneUncollectedFrames = observation.incompleteFrames.length === 0;
+		for (const [ref, entry] of [...this.refs]) {
+			if (entry.targetId !== observation.targetId) continue;
+			const liveSet = liveBackendIdsByFrame.get(entry.frameId);
+			if (liveSet) {
+				if (!liveSet.has(entry.backendNodeId)) this.lifecycle.deleteRef(ref);
+			} else if (pruneUncollectedFrames) {
+				this.lifecycle.deleteRef(ref);
+			}
+		}
+		this.pruneRefs(observation.targetId);
 	}
 
 	/** SPAs can mint refs indefinitely without ever navigating; bound per-target growth by evicting the oldest. */

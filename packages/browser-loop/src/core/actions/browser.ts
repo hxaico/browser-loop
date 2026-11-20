@@ -49,6 +49,9 @@ export interface BrowserActionSnapshot {
 	ref?: string;
 	depth?: number;
 	include_cursor?: boolean;
+	diff?: boolean;
+	max_diff_change_ratio?: number;
+	force_full?: boolean;
 	tab_id?: string;
 }
 
@@ -397,6 +400,9 @@ export function createBrowserActionSchemaByType(options: BrowserActionSchemaOpti
 				ref: Type.Optional(Type.String({ description: "Restrict the snapshot to the subtree rooted at this element reference." })),
 				depth: Type.Optional(Type.Number({ description: "Maximum tree depth (default 15)." })),
 				include_cursor: Type.Optional(Type.Boolean({ description: "Include cursor:pointer clickable hints (default true)." })),
+				diff: Type.Optional(Type.Boolean({ description: "Return a hierarchical ref-preserving diff against the previous snapshot when change is bounded (default false)." })),
+				max_diff_change_ratio: Type.Optional(Type.Number({ minimum: 0, maximum: 1, description: "Maximum changed-node ratio allowed before falling back to a full snapshot (default 0.40)." })),
+				force_full: Type.Optional(Type.Boolean({ description: "Bypass unchanged short-circuit and diffing to return a fresh full snapshot (default false)." })),
 				tab_id: TabId(),
 			},
 			{ additionalProperties: false },

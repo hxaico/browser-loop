@@ -173,6 +173,19 @@ export interface BrowserWaitForResult {
 	details: string[];
 }
 
+/** Structured reason why `browser_snapshot` with `diff: true` fell back to a full snapshot instead of emitting an AXTree diff. */
+export type SnapshotDiffSkipReason =
+	| "no_baseline"
+	| "truncated"
+	| "incomplete_frame_dropped"
+	| "projection_mismatch"
+	| "url_or_gen_changed"
+	| "empty"
+	| "invalid_max_ratio"
+	| "unchanged"
+	| "change_ratio"
+	| "diff_too_large";
+
 export type BatchReadResult =
 	| { type: "screenshot"; data: Buffer; mimeType: string }
 	| { type: "url"; url: string }
@@ -185,6 +198,8 @@ export type BatchReadResult =
 		title?: string;
 		targetId?: string;
 		unchanged?: boolean;
+		diff?: boolean;
+		diffSkipReason?: SnapshotDiffSkipReason;
 	}
 	| { type: "browser_state"; state: BrowserState }
 	| { type: "browser_wait_for"; result: BrowserWaitForResult }

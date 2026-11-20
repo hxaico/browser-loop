@@ -152,6 +152,7 @@ describe("BrowserExecutor attach, isolated cursor scan, snapshot metadata, evalu
 			title: "Example Store",
 			targetId: "abcdef1234567890",
 			unchanged: false,
+			diff: false,
 		});
 		expect(second[0]).toEqual({
 			type: "browser_text",
@@ -161,6 +162,7 @@ describe("BrowserExecutor attach, isolated cursor scan, snapshot metadata, evalu
 			title: "Example Store",
 			targetId: "abcdef1234567890",
 			unchanged: true,
+			diff: false,
 		});
 	});
 
@@ -394,6 +396,7 @@ describe("BrowserExecutor attach, isolated cursor scan, snapshot metadata, evalu
 				title: "Example Store",
 				targetId: "abcdef1234567890",
 				unchanged: false,
+				diff: false,
 			},
 		]);
 
