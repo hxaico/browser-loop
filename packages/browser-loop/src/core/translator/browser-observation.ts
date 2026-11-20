@@ -34,6 +34,11 @@ export interface ObservationLine {
 	readonly text: string;
 	readonly refNode?: AXNode;
 	readonly ctx: RenderContext;
+	readonly depth: number;
+	readonly role: string;
+	readonly name: string;
+	readonly parentLineIndex?: number;
+	readonly nodeKey: string;
 }
 
 /** Accessibility tree collected for one frame. */
@@ -76,6 +81,7 @@ export interface BrowserObservation {
 export interface BrowserPresentation {
 	readonly observation: BrowserObservation;
 	readonly cacheKey: string;
+	readonly projectionKey?: string;
 	readonly lines: readonly ObservationLine[];
 	readonly shape: string;
 }
@@ -221,7 +227,7 @@ export function renderObservationNode(
 	parentName: string,
 	ctx: RenderContext,
 	interactiveOnly: boolean,
-): { text: string; refNode?: AXNode } | undefined {
+): { text: string; refNode?: AXNode; role: string; name: string } | undefined {
 	const role = node.role?.value ?? "";
 	const name = node.name?.value ?? "";
 	const interactive = INTERACTIVE_ROLES.has(role);
@@ -239,7 +245,7 @@ export function renderObservationNode(
 	const states = collectStates(node);
 	if (pointer && !interactive) states.push("cursor:pointer");
 	if (states.length > 0) line += ` [${states.join(", ")}]`;
-	return { text: line, refNode };
+	return { text: line, refNode, role, name };
 }
 
 function collectStates(node: AXNode): string[] {
@@ -259,7 +265,12 @@ function collectStates(node: AXNode): string[] {
 			case "disabled":
 			case "selected":
 			case "required":
+			case "readonly":
 				if (value === true || value === "true") states.push(property.name);
+				break;
+			case "invalid":
+				if (value === true || value === "true") states.push("invalid");
+				else if (value === "grammar" || value === "spelling") states.push(`invalid=${value}`);
 				break;
 			case "level":
 				if (typeof value === "number") states.push(`level=${value}`);

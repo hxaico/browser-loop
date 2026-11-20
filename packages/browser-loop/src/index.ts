@@ -23,9 +23,13 @@ export type {
 export { formatBrowserActResult } from "./core/browser-result-format";
 export type { KernelBrowser } from "./core/translator/translator";
 export { InternalComputerTranslator } from "./core/translator/translator";
-export { CdpConnection } from "./core/translator/cdp";
-export { BrowserExecutor } from "./core/translator/browser";
-export type { BrowserFindCandidate } from "./core/translator/browser";
+export { CdpConnection, CdpProtocolError } from "./core/translator/cdp";
+export { BrowserEvaluateError, BrowserExecutor } from "./core/translator/browser";
+export type {
+	BrowserEvaluateOptions,
+	BrowserFindCandidate,
+	BrowserScreenshotOptions,
+} from "./core/translator/browser";
 export type { BrowserRefState } from "./core/translator/browser-ref-lifecycle";
 export type {
 	BatchExecutionResult,

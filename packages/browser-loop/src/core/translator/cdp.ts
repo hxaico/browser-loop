@@ -28,6 +28,7 @@ export interface CdpTargetInfo {
 }
 
 export type CdpEventListener = (event: CdpEventMessage) => void;
+export type CdpCloseListener = () => void;
 
 /** A command error returned by the CDP JSON-RPC endpoint. */
 export class CdpProtocolError extends Error {
@@ -45,15 +46,25 @@ export class CdpProtocolError extends Error {
 export class CdpConnection {
 	private socket?: WebSocket;
 	private opening?: Promise<WebSocket>;
+	private openingSocket?: WebSocket;
 	private nextId = 1;
 	private readonly pending = new Map<number, PendingCommand>();
 	private readonly listeners = new Set<CdpEventListener>();
+	private readonly closeListeners = new Set<CdpCloseListener>();
 	private readonly sessionsByTarget = new Map<string, string>();
+	private readonly pendingAttaches = new Map<string, Promise<string>>();
 
 	constructor(private readonly wsUrl: string) {}
 
 	onEvent(listener: CdpEventListener): void {
 		this.listeners.add(listener);
+	}
+
+	onClose(listener: CdpCloseListener): () => void {
+		this.closeListeners.add(listener);
+		return () => {
+			this.closeListeners.delete(listener);
+		};
 	}
 
 	async send<T = Record<string, unknown>>(method: string, params: Record<string, unknown> = {}, sessionId?: string): Promise<T> {
@@ -88,9 +99,24 @@ export class CdpConnection {
 	async attachToTarget(targetId: string): Promise<string> {
 		const cached = this.sessionsByTarget.get(targetId);
 		if (cached) return cached;
-		const { sessionId } = await this.send<{ sessionId: string }>("Target.attachToTarget", { targetId, flatten: true });
-		this.sessionsByTarget.set(targetId, sessionId);
-		return sessionId;
+		const existing = this.pendingAttaches.get(targetId);
+		if (existing) return existing;
+		let pending!: Promise<string>;
+		pending = (async () => {
+			try {
+				const { sessionId } = await this.send<{ sessionId: string }>("Target.attachToTarget", { targetId, flatten: true });
+				if (this.pendingAttaches.get(targetId) === pending) {
+					this.sessionsByTarget.set(targetId, sessionId);
+				}
+				return sessionId;
+			} finally {
+				if (this.pendingAttaches.get(targetId) === pending) {
+					this.pendingAttaches.delete(targetId);
+				}
+			}
+		})();
+		this.pendingAttaches.set(targetId, pending);
+		return pending;
 	}
 
 	async createTarget(url: string): Promise<string> {
@@ -99,11 +125,19 @@ export class CdpConnection {
 	}
 
 	close(): void {
-		this.socket?.close();
+		const socket = this.socket ?? this.openingSocket;
 		this.socket = undefined;
 		this.opening = undefined;
+		this.openingSocket = undefined;
 		this.sessionsByTarget.clear();
+		this.pendingAttaches.clear();
 		this.rejectPending(new Error("CDP connection closed"));
+		socket?.close();
+		this.emitClose();
+	}
+
+	private emitClose(): void {
+		for (const listener of [...this.closeListeners]) listener();
 	}
 
 	private rejectPending(error: Error): void {
@@ -115,19 +149,32 @@ export class CdpConnection {
 		if (this.socket && this.socket.readyState === WebSocket.OPEN) return Promise.resolve(this.socket);
 		this.opening ??= new Promise<WebSocket>((resolve, reject) => {
 			const socket = new WebSocket(this.wsUrl);
+			this.openingSocket = socket;
 			socket.addEventListener("open", () => {
+				if (this.openingSocket !== socket) {
+					socket.close();
+					reject(new Error("CDP connection closed"));
+					return;
+				}
+				this.openingSocket = undefined;
 				this.socket = socket;
 				resolve(socket);
 			});
 			socket.addEventListener("error", () => {
+				if (this.openingSocket === socket) this.openingSocket = undefined;
 				this.opening = undefined;
 				reject(new Error(`CDP connection to ${this.wsUrl} failed`));
 			});
 			socket.addEventListener("close", () => {
+				if (this.socket !== socket && this.openingSocket !== socket) return;
 				this.socket = undefined;
 				this.opening = undefined;
+				this.openingSocket = undefined;
 				this.sessionsByTarget.clear();
+				this.pendingAttaches.clear();
 				this.rejectPending(new Error("CDP connection closed"));
+				reject(new Error("CDP connection closed"));
+				this.emitClose();
 			});
 			socket.addEventListener("message", (event) => {
 				this.handleMessage(typeof event.data === "string" ? event.data : String(event.data));
@@ -169,9 +216,14 @@ export class CdpConnection {
 		if (typeof message.method === "string") {
 			if (message.method === "Target.detachedFromTarget") {
 				const detached = message.params?.sessionId;
+				const detachedTarget = typeof message.params?.targetId === "string" ? message.params.targetId : undefined;
 				for (const [targetId, sessionId] of this.sessionsByTarget) {
-					if (sessionId === detached) this.sessionsByTarget.delete(targetId);
+					if (sessionId === detached) {
+						this.sessionsByTarget.delete(targetId);
+						this.pendingAttaches.delete(targetId);
+					}
 				}
+				if (detachedTarget) this.pendingAttaches.delete(detachedTarget);
 			}
 			const event: CdpEventMessage = { method: message.method, params: message.params ?? {}, sessionId: message.sessionId };
 			for (const listener of this.listeners) listener(event);

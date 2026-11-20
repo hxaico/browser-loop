@@ -185,7 +185,16 @@ function formatReadResults(
 				break;
 			case "browser_text":
 				content.push({ type: "text", text: read.text });
-				details.push({ type: "browser_text", label: read.label, bytes: read.text.length });
+				details.push({
+					type: "browser_text",
+					label: read.label,
+					bytes: read.text.length,
+					...(read.url !== undefined ? { url: read.url } : {}),
+					...(read.title !== undefined ? { title: read.title } : {}),
+					...(read.targetId !== undefined ? { targetId: read.targetId } : {}),
+					...(read.unchanged !== undefined ? { unchanged: read.unchanged } : {}),
+					...(read.diff !== undefined ? { diff: read.diff } : {}),
+				});
 				break;
 			case "browser_state": {
 				const text = formatBrowserState(read.state);

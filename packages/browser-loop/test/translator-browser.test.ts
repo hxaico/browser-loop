@@ -113,7 +113,12 @@ describe("browser_act orchestration", () => {
 			},
 			wait: options.wait ?? (async () => waits.shift() ?? waitResult("newly_verified")),
 			evaluate: (expect, state, baseline) => evaluateBrowserExpectation(expect, state, baseline, () => ({ truth: undefined, details: ["ref unavailable"] })),
-			present: (state): BrowserPresentation => ({ observation: state, cacheKey: "", shape: state.title, lines: [{ text: `RootWebArea ${state.title} [\u0000]`, ctx: {} as never }] }),
+			present: (state): BrowserPresentation => ({
+				observation: state,
+				cacheKey: "",
+				shape: state.title,
+				lines: [{ text: `RootWebArea ${state.title} [\u0000]`, ctx: {} as never, depth: 0, role: "RootWebArea", name: state.title, nodeKey: "root" }],
+			}),
 			render: (presentation) => presentation.shape,
 		};
 	}
@@ -462,7 +467,7 @@ describe("browser_act orchestration", () => {
 			observation: state,
 			cacheKey: "",
 			shape: lines.join("\n"),
-			lines: lines.map((text) => ({ text, ctx: {} as never })),
+			lines: lines.map((text, index) => ({ text, ctx: {} as never, depth: 0, role: "node", name: text, nodeKey: `line:${index}` })),
 		});
 		const diff = diffObservations(
 			presentation(beforeObservation, ["button Save [\u0000]", "button Save [\u0000]", "text old"]),
@@ -605,6 +610,7 @@ function createFakeCdp(initialNodes: unknown[] = []) {
 	let autoNavigationLifecycle = true;
 	let historyNavigationMode: "load" | "bfcache" = "load";
 	let navigationSequence = 0;
+	let isolatedWorldSequence = 0;
 	const navigationHistory = { currentIndex: 1, entries: [{ id: 1, url: "https://before.test" }, { id: 2, url: "https://a.test" }, { id: 3, url: "https://after.test" }] };
 	const sessionTrees = new Map<string, Array<{ backendDOMNodeId?: number }>>();
 	const frameTrees = new Map<string, Array<{ backendDOMNodeId?: number }>>();
@@ -705,6 +711,8 @@ function createFakeCdp(initialNodes: unknown[] = []) {
 				case "DOM.resolveNode":
 					requireBackendId(params.backendNodeId, sessionId);
 					return { object: { objectId: "node-obj" } };
+				case "Page.createIsolatedWorld":
+					return { executionContextId: ++isolatedWorldSequence };
 				case "Runtime.evaluate":
 					if (params.returnByValue === false) return { result: { objectId: "cursor-scan" } };
 					return { result: { value: runtimeValue } };
@@ -1250,7 +1258,7 @@ describe("BrowserExecutor snapshot rendering", () => {
 		const { cdp } = createFakeCdp(tree);
 		const executor = new BrowserExecutor(cdp);
 		expect(await snapshotText(executor)).toBe('RootWebArea "Page"\n  button "Save" [e1]');
-		expect(await snapshotText(executor, { depth: 1 })).toBe('RootWebArea "Page"\n  button "Save" [e2]');
+		expect(await snapshotText(executor, { depth: 1 })).toBe('RootWebArea "Page"\n  button "Save" [e1]');
 	});
 
 	it("treats treeitem as interactive and the bogus textarea role as non-interactive", async () => {
@@ -1581,7 +1589,9 @@ describe("BrowserExecutor snapshot diffing", () => {
 		const { cdp } = createFakeCdp(BUTTON_TREE);
 		const executor = new BrowserExecutor(cdp);
 		await snapshotText(executor);
-		expect(await snapshotText(executor, { filter: "interactive" })).toContain('button "Save" [e2]');
+		const filtered = await snapshotText(executor, { filter: "interactive" });
+		expect(filtered).toContain('button "Save" [e1]');
+		expect(filtered).not.toContain("RootWebArea");
 	});
 });
 
@@ -2299,10 +2309,16 @@ describe("BrowserExecutor ref state export/import", () => {
 		await snapshotText(first);
 		const state = first.exportRefState();
 
-		const { cdp, emit } = createFakeCdp(BUTTON_TREE);
+		const { cdp, emit } = createFakeCdp([
+			ax({ nodeId: "1", role: "RootWebArea", name: "Page", childIds: ["2", "3"] }),
+			ax({ nodeId: "2", role: "button", name: "Save", backendDOMNodeId: 42, parentId: "1" }),
+			ax({ nodeId: "3", role: "button", name: "Cancel", backendDOMNodeId: 43, parentId: "1" }),
+		]);
 		const second = new BrowserExecutor(cdp);
 		second.importRefState(state);
-		expect(await snapshotText(second)).toContain('button "Save" [e2]');
+		const snap = await snapshotText(second);
+		expect(snap).toContain('button "Save" [e1]');
+		expect(snap).toContain('button "Cancel" [e2]');
 
 		emit({ method: "Page.frameNavigated", params: { frame: { id: "F0" } }, sessionId: "session-1" });
 		await expect(second.execute({ type: "browser_click", ref: "e1" } as BrowserAction)).rejects.toThrow(/stale/);
@@ -2678,5 +2694,42 @@ describe("BrowserExecutor cross-process frame document identity", () => {
 		const executor = new BrowserExecutor(fake.cdp);
 		const future: BrowserRefState = { version: 2, refCounter: 0, generations: [], refs: [] };
 		expect(() => executor.importRefState(future)).toThrow(/version 2/);
+	});
+});
+
+describe("BrowserExecutor evaluateValue abort handling", () => {
+	it("never dispatches CDP commands when already aborted or invalid timeoutMs", async () => {
+		const fake = createFakeCdp(BUTTON_TREE);
+		const executor = new BrowserExecutor(fake.cdp);
+
+		const aborted = new AbortController();
+		aborted.abort(new Error("pre-aborted"));
+		await expect(executor.evaluateValue("1 + 1", { signal: aborted.signal })).rejects.toThrow("pre-aborted");
+		expect(fake.sent).toHaveLength(0);
+
+		await expect(executor.evaluateValue("1 + 1", { timeoutMs: -1 })).rejects.toThrow("timeoutMs must be a non-negative finite number");
+		expect(fake.sent).toHaveLength(0);
+	});
+
+	it("never invokes Runtime.evaluate when aborted mid-flight during attach or getFrameTree", async () => {
+		const fakeAttach = createFakeCdp(BUTTON_TREE);
+		const attachController = new AbortController();
+		fakeAttach.setSendHook((method) => {
+			if (method === "Page.enable") attachController.abort(new Error("aborted on attach"));
+		});
+		const attachExecutor = new BrowserExecutor(fakeAttach.cdp);
+		await expect(attachExecutor.evaluateValue("1 + 1", { signal: attachController.signal })).rejects.toThrow("aborted on attach");
+		expect(fakeAttach.sent.some((cmd) => cmd.method === "Runtime.evaluate")).toBe(false);
+
+		const fakeFrameTree = createFakeCdp(BUTTON_TREE);
+		const frameController = new AbortController();
+		fakeFrameTree.setSendHook((method) => {
+			if (method === "Page.getFrameTree") frameController.abort(new Error("aborted on frameTree"));
+		});
+		const frameExecutor = new BrowserExecutor(fakeFrameTree.cdp);
+		await expect(
+			frameExecutor.evaluateValue("1 + 1", { isolated: true, signal: frameController.signal }),
+		).rejects.toThrow("aborted on frameTree");
+		expect(fakeFrameTree.sent.some((cmd) => cmd.method === "Runtime.evaluate")).toBe(false);
 	});
 });
