@@ -544,14 +544,127 @@ describe("BrowserExecutor hierarchical AXTree diffs", () => {
 		expect(diffStart.indexOf('~   button "Item D"')).toBeLessThan(diffStart.indexOf('    button "Item A"'));
 	});
 
+	it("anchors newly inserted rows with a surviving neighbor so insertion positions are distinct", () => {
+		const makeRow = (label: string, ref: string) => ({
+			line: `  button "Row ${label}" [${ref}]`,
+			depth: 1,
+			role: "button",
+			name: `Row ${label}`,
+			parentLineIndex: 0,
+			nodeKey: `k_${label}`,
+			ref,
+		});
+		const makeSnapshot = (rows: Array<[string, string]>) => [
+			{ line: 'RootWebArea "Table"', depth: 0, role: "RootWebArea", name: "Table", nodeKey: "r" },
+			...rows.map(([label, ref]) => makeRow(label, ref)),
+			...Array.from({ length: 12 }, (_, i) => ({
+				line: `  StaticText "Padding row ${i} keeping change ratio small"`,
+				depth: 1,
+				role: "StaticText",
+				name: `Padding row ${i} keeping change ratio small`,
+				parentLineIndex: 0,
+				nodeKey: `pad_${i}`,
+			})),
+		];
+		const baseRows: Array<[string, string]> = [
+			["A", "e1"],
+			["B", "e2"],
+			["C", "e3"],
+			["D", "e4"],
+			["E", "e5"],
+			["F", "e6"],
+		];
+		const baseline = {
+			projectionKey: "k",
+			url: "https://a.test",
+			mainGeneration: 0,
+			wasTruncated: false,
+			nodes: makeSnapshot(baseRows),
+		};
+
+		const insertedAfterB = makeSnapshot([
+			["A", "e1"],
+			["B", "e2"],
+			["New1", "e7"],
+			["New2", "e8"],
+			["C", "e3"],
+			["D", "e4"],
+			["E", "e5"],
+			["F", "e6"],
+		]);
+		const diffAfterB = formatSnapshotDiff({
+			baseline,
+			currentNodes: insertedAfterB,
+			fullText: insertedAfterB.map((n) => n.line).join("\n"),
+			projectionKey: "k",
+			url: "https://a.test",
+			mainGeneration: 0,
+			wasTruncated: false,
+		})!;
+
+		const insertedAfterD = makeSnapshot([
+			["A", "e1"],
+			["B", "e2"],
+			["C", "e3"],
+			["D", "e4"],
+			["New1", "e7"],
+			["New2", "e8"],
+			["E", "e5"],
+			["F", "e6"],
+		]);
+		const diffAfterD = formatSnapshotDiff({
+			baseline,
+			currentNodes: insertedAfterD,
+			fullText: insertedAfterD.map((n) => n.line).join("\n"),
+			projectionKey: "k",
+			url: "https://a.test",
+			mainGeneration: 0,
+			wasTruncated: false,
+		})!;
+
+		const insertedAtStart = makeSnapshot([
+			["New1", "e7"],
+			["New2", "e8"],
+			["A", "e1"],
+			["B", "e2"],
+			["C", "e3"],
+			["D", "e4"],
+			["E", "e5"],
+			["F", "e6"],
+		]);
+		const diffAtStart = formatSnapshotDiff({
+			baseline,
+			currentNodes: insertedAtStart,
+			fullText: insertedAtStart.map((n) => n.line).join("\n"),
+			projectionKey: "k",
+			url: "https://a.test",
+			mainGeneration: 0,
+			wasTruncated: false,
+		})!;
+
+		expect(diffAfterB).toBeDefined();
+		expect(diffAfterD).toBeDefined();
+		expect(diffAtStart).toBeDefined();
+		expect(diffAfterB).not.toBe(diffAfterD);
+		expect(diffAfterB).toContain('    button "Row B" [e2]');
+		expect(diffAfterB).not.toContain('    button "Row C"');
+		expect(diffAfterD).toContain('    button "Row D" [e4]');
+		expect(diffAtStart).toContain('    button "Row A" [e1]');
+		expect(diffAtStart.indexOf('+   button "Row New2" [e8]')).toBeLessThan(diffAtStart.indexOf('    button "Row A" [e1]'));
+	});
+
 	it("disables diffing on incomplete frames and does not emit false UNCHANGED_SNAPSHOT on recovery", async () => {
 		let frameReady = true;
 		let bannerName = "Welcome";
+		const paddingIds = Array.from({ length: 8 }, (_, i) => `pad_${i}`);
 		const mainNodes = () => [
-			ax({ nodeId: "root", role: "RootWebArea", name: "Host", childIds: ["banner", "frame", "footer"] }),
+			ax({ nodeId: "root", role: "RootWebArea", name: "Host", childIds: ["banner", "frame", "footer", ...paddingIds] }),
 			ax({ nodeId: "banner", role: "StaticText", name: bannerName, parentId: "root" }),
 			ax({ nodeId: "frame", role: "Iframe", name: "Checkout Frame", backendDOMNodeId: 50, parentId: "root" }),
 			ax({ nodeId: "footer", role: "StaticText", name: "Footer", parentId: "root" }),
+			...paddingIds.map((id, i) =>
+				ax({ nodeId: id, role: "StaticText", name: `Legal notice line ${i} in checkout footer`, parentId: "root" }),
+			),
 		];
 		const frameNodes = [
 			ax({ nodeId: "froot", role: "RootWebArea", name: "Inner", childIds: ["fbtn"] }),

@@ -343,6 +343,22 @@ function computeIncludedAfterIndices(
 		else if (pos >= 0 && pos + 1 < siblings.length) included.add(siblings[pos + 1]!);
 	}
 
+	// Include one surviving sibling anchor per contiguous added run inside a surviving parent.
+	for (const idx of addedIndices) {
+		const parentLineIndex = currentNodes[idx]!.parentLineIndex;
+		if (parentLineIndex !== undefined && addedIndices.has(parentLineIndex)) continue;
+		const siblings = afterChildrenByParentIdx.get(parentLineIndex ?? -1) ?? [];
+		const pos = siblings.indexOf(idx);
+		if (pos < 0 || (pos > 0 && addedIndices.has(siblings[pos - 1]!))) continue;
+		if (pos > 0) {
+			included.add(siblings[pos - 1]!);
+		} else {
+			let afterRun = pos + 1;
+			while (afterRun < siblings.length && addedIndices.has(siblings[afterRun]!)) afterRun += 1;
+			if (afterRun < siblings.length) included.add(siblings[afterRun]!);
+		}
+	}
+
 	// Include ALL rendered ancestors along parentLineIndex (zero hardcoded role filter).
 	for (const idx of [...included]) {
 		let parentIdx = currentNodes[idx]!.parentLineIndex;
